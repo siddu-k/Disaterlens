@@ -28,7 +28,7 @@ class HazardMetadata(BaseModel):
 class HazardOutput(BaseModel):
     disaster_type: str
     model_name: str
-    timesteps: List[float] = Field(description="Timestep points in hours")
+    timesteps: List[float] = Field(description="Timestep points in native time_unit")
     frames: List[List[List[float]]] = Field(description="2D grids for each timestep")
     max_hazard: List[List[float]] = Field(description="Envelope of maximum intensity/depth across all timesteps")
     rows: int
@@ -36,6 +36,9 @@ class HazardOutput(BaseModel):
     hazard_unit: str
     threshold_impact: float = Field(description="Threshold at which exposure suffers moderate-to-severe impact")
     total_time_hours: float
+    time_unit: str = Field(default="hours", description="Time unit of timesteps: seconds, minutes, or hours")
+    total_time: float = Field(default=24.0, description="Total duration in time_unit")
+    timestep_labels: List[str] = Field(default_factory=list, description="Human-readable labels for each timestep")
     metadata: Dict[str, Any]
 
 

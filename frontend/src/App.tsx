@@ -380,14 +380,27 @@ function App() {
   const totalFrames = result?.simulation.frames.length || 0;
   const currentTime = result?.simulation.timesteps?.[currentFrame] ?? 0;
   const totalSimulationHours = result?.simulation.total_time_hours || durationHours;
+  const timeUnit = result?.simulation.time_unit || (disasterType === 'earthquake' ? 'seconds' : disasterType === 'landslide' ? 'minutes' : 'hours');
+  const totalSimulationTime = result?.simulation.total_time ?? (
+    disasterType === 'earthquake' ? 90 : disasterType === 'landslide' ? 15 : totalSimulationHours
+  );
+  const timestepLabels = result?.simulation.timestep_labels || [];
   const roadStatus = impact?.road_status;
   const totalRoads = roadStatus?.total || 1;
   const openPct = Math.round(((roadStatus?.open || 0) / totalRoads) * 100);
   const restrictedPct = Math.round(((roadStatus?.restricted || 0) / totalRoads) * 100);
   const closedPct = Math.round(((roadStatus?.closed || 0) / totalRoads) * 100);
 
-  const formatTimelineHours = (hoursVal: number) => {
-    const totalMinutes = Math.round(hoursVal * 60);
+  const formatSimulationTime = (val: number) => {
+    if (timeUnit === 'seconds' || timeUnit === 's') {
+      return `${Math.round(val)}s`;
+    }
+    if (timeUnit === 'minutes' || timeUnit === 'min') {
+      const m = Math.floor(val);
+      const s = Math.round((val - m) * 60);
+      return s > 0 ? `${m}m ${s}s` : `${m} min`;
+    }
+    const totalMinutes = Math.round(val * 60);
     const hrs = Math.floor(totalMinutes / 60);
     const mins = totalMinutes % 60;
     return `${hrs.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')} h`;
@@ -646,6 +659,7 @@ function App() {
                 onBboxSelect={handleBboxSelection}
                 result={result}
                 currentFrame={currentFrame}
+                setCurrentFrame={setCurrentFrame}
                 bbox={bbox}
                 showEvacuationRoutes={showEvacuationRoutes}
                 selectedRoad={selectedRoad}
@@ -655,6 +669,9 @@ function App() {
                 focusedFacility={focusedFacility}
                 buildingDensity={buildingDensity}
                 isPlaying={isPlaying}
+                setIsPlaying={setIsPlaying}
+                playSpeed={playSpeed}
+                setPlaySpeed={setPlaySpeed}
               />
             </ErrorBoundary>
 
@@ -691,20 +708,44 @@ function App() {
                   }}
                 />
                 <div className="map-timeline-ticks">
-                  <span>0h</span>
-                  <span>3h</span>
-                  <span>6h</span>
-                  <span>9h</span>
-                  <span>12h</span>
-                  <span>15h</span>
-                  <span>18h</span>
-                  <span>21h</span>
-                  <span>24h</span>
+                  {timestepLabels.length > 0 ? (
+                    timestepLabels.map((lbl, idx) => <span key={idx}>{lbl}</span>)
+                  ) : timeUnit === 'seconds' ? (
+                    <>
+                      <span>0s</span>
+                      <span>15s</span>
+                      <span>30s</span>
+                      <span>45s</span>
+                      <span>60s</span>
+                      <span>90s</span>
+                    </>
+                  ) : timeUnit === 'minutes' ? (
+                    <>
+                      <span>0m</span>
+                      <span>2m</span>
+                      <span>5m</span>
+                      <span>8m</span>
+                      <span>12m</span>
+                      <span>15m</span>
+                    </>
+                  ) : (
+                    <>
+                      <span>0h</span>
+                      <span>3h</span>
+                      <span>6h</span>
+                      <span>9h</span>
+                      <span>12h</span>
+                      <span>15h</span>
+                      <span>18h</span>
+                      <span>21h</span>
+                      <span>24h</span>
+                    </>
+                  )}
                 </div>
               </div>
 
               <div className="map-timeline-time-badge">
-                {formatTimelineHours(currentTime)}
+                {formatSimulationTime(currentTime)}
               </div>
 
               <div className="map-timeline-speed-pill" onClick={() => setPlaySpeed(playSpeed === 1 ? 2 : playSpeed === 2 ? 4 : 1)} role="button" aria-label="Cycle playback speed" title="Cycle playback speed">
@@ -738,10 +779,10 @@ function App() {
                     : disasterType === 'cyclone'
                     ? `${durationHours}-hour Cyclone Landfall`
                     : disasterType === 'earthquake'
-                    ? `Mw ${magnitude} Severe Earthquake`
+                    ? `Mw ${magnitude} Severe Earthquake (90s Rupture)`
                     : disasterType === 'wildfire'
-                    ? `${durationHours}-hour Wildfire`
-                    : `${durationHours}-hour Monsoon Landslide`}
+                    ? `${durationHours}-hour Wildfire Spread`
+                    : `Slope Failure & Debris Flow (15 min Runout)`}
                 </span>
               </div>
               <div className="scenario-sliders-group">
@@ -945,7 +986,7 @@ function App() {
                     </div>
                     <div className="scenario-slider-row">
                       <div className="scenario-slider-meta">
-                        <span>Duration</span>
+                        <span>Antecedent Saturation</span>
                         <span className="scenario-slider-val">{durationHours} hours</span>
                       </div>
                       <input
@@ -957,6 +998,9 @@ function App() {
                         value={durationHours}
                         onChange={(e) => setDurationHours(Number(e.target.value))}
                       />
+                    </div>
+                    <div style={{ fontSize: 11, color: '#94a3b8', padding: '2px 0 4px 0' }}>
+                      ⏱️ Catastrophic Runout Event: 15 minutes
                     </div>
                   </>
                 )}

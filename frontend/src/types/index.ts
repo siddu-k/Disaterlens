@@ -193,6 +193,9 @@ export interface SimulationResult {
     rows: number;
     cols: number;
     total_time_hours: number;
+    time_unit?: string;
+    total_time?: number;
+    timestep_labels?: string[];
     disaster_type: string;
     hazard_unit: string;
     model_name: string;

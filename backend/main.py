@@ -515,6 +515,9 @@ def run_simulation_endpoint(request: SimulationRequest):
             "rows": hazard_output.rows,
             "cols": hazard_output.cols,
             "total_time_hours": hazard_output.total_time_hours,
+            "time_unit": getattr(hazard_output, "time_unit", "hours"),
+            "total_time": getattr(hazard_output, "total_time", hazard_output.total_time_hours),
+            "timestep_labels": getattr(hazard_output, "timestep_labels", [f"{t}h" for t in hazard_output.timesteps]),
             "disaster_type": disaster_type,
             "hazard_unit": hazard_output.hazard_unit,
             "model_name": hazard_output.model_name,
@@ -722,5 +725,4 @@ if __name__ == "__main__":
     import uvicorn
     logger.info("\n[*] DisasterLens API Server Starting...")
     logger.info("    Gemini API: %s", '[OK] Configured' if config.GEMINI_API_KEY else '[!] Offline mode (deterministic rule-based insights)')
-    logger.info("    Starting on http://localhost:8000\n")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

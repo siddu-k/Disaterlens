@@ -250,6 +250,9 @@ class FloodHazardModule(BaseHazardModule):
             hazard_unit="meters",
             threshold_impact=config.FLOOD_DEPTH_MIN,
             total_time_hours=round(duration_hours, 1),
+            time_unit="hours",
+            total_time=round(duration_hours, 1),
+            timestep_labels=[f"{round(t, 1)}h" for t in timesteps],
             metadata={
                 "peak_depth_m": float(np.nanmax(max_depth)),
                 "rainfall_mm": rainfall_mm,

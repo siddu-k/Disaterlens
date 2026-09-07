@@ -94,6 +94,11 @@ class CycloneHazardModule(BaseHazardModule):
         max_wind_grid = np.zeros((rows, cols), dtype=np.float64)
 
         for t_idx, t in enumerate(timesteps):
+            if t_idx == 0 or t <= 0.0:
+                # Baseline pre-storm ambient condition at 0h
+                frames.append(np.zeros((rows, cols), dtype=np.float64).tolist())
+                continue
+
             frac = t / max(duration_hours, 1.0)
             eye_lat = track_start[0] + frac * (track_end[0] - track_start[0])
             eye_lon = track_start[1] + frac * (track_end[1] - track_start[1])
@@ -142,6 +147,9 @@ class CycloneHazardModule(BaseHazardModule):
             hazard_unit="Wind Speed (km/h)",
             threshold_impact=118.0,  # Hurricane force wind threshold (Cat 1: 119 km/h)
             total_time_hours=duration_hours,
+            time_unit="hours",
+            total_time=duration_hours,
+            timestep_labels=[f"{round(t, 1)}h" for t in timesteps],
             metadata={
                 "central_pressure_hpa": p_cen,
                 "peak_wind_kmh": round(float(np.max(max_wind_grid)), 1),

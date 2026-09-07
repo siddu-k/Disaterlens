@@ -88,6 +88,7 @@ interface MapViewProps {
   onBboxSelect: (bbox: BoundingBox) => void;
   result: SimulationResult | null;
   currentFrame: number;
+  setCurrentFrame?: (frame: number) => void;
   bbox: BoundingBox | null;
   showEvacuationRoutes: boolean;
   selectedRoad: RoadFeature | null;
@@ -97,6 +98,9 @@ interface MapViewProps {
   focusedFacility?: { fac: Facility; nonce: number } | null;
   buildingDensity?: 'medium' | 'maximum';
   isPlaying?: boolean;
+  setIsPlaying?: (playing: boolean) => void;
+  playSpeed?: number;
+  setPlaySpeed?: (speed: number) => void;
 }
 
 const TILE_URLS = {
@@ -317,6 +321,7 @@ export default function MapView({
   onBboxSelect,
   result,
   currentFrame,
+  setCurrentFrame,
   bbox,
   showEvacuationRoutes,
   selectedRoad,
@@ -326,6 +331,9 @@ export default function MapView({
   focusedFacility,
   buildingDensity,
   isPlaying,
+  setIsPlaying,
+  playSpeed,
+  setPlaySpeed,
 }: MapViewProps) {
   const hz = hazardDisplay(disasterType);
   const mapContainerRef = useRef<HTMLDivElement>(null);
@@ -640,11 +648,16 @@ export default function MapView({
     const allBuildings = result.geodata?.buildings || [];
     const facilities = result.impact?.facilities || [];
 
-    // Playback guard (see ref comment above): same scene + playing ⇒ keep layers.
+    const sim = result.simulation;
+    const frames = sim?.frames || [];
+    const frameIdx = Math.min(currentFrame, Math.max(0, frames.length - 1));
+
+    // Playback guard: during active timeline playback, skip heavy vector DOM rebuilds to keep FPS smooth.
+    // On pause or manual slider scrubbing, vectors update to match frameIdx.
     const vpKey = mapViewport
       ? `${mapViewport.south.toFixed(4)},${mapViewport.west.toFixed(4)},${mapViewport.north.toFixed(4)},${mapViewport.east.toFixed(4)}`
       : 'novp';
-    const renderKey = `${result.run_uuid || 'noid'}-${mapZoom}-${buildingDensity || 'medium'}-${vpKey}`;
+    const renderKey = `${result.run_uuid || 'noid'}-${mapZoom}-${buildingDensity || 'medium'}-${vpKey}-${frameIdx}`;
     if (isPlaying && vectorRenderKeyRef.current === renderKey) return;
     vectorRenderKeyRef.current = renderKey;
 
@@ -699,9 +712,6 @@ export default function MapView({
       }
     }
 
-    const sim = result.simulation;
-    const frames = sim?.frames || [];
-    const frameIdx = Math.min(currentFrame, Math.max(0, frames.length - 1));
     const currentGrid = frames[frameIdx];
     const b = result.bbox;
     const latSpan = b ? Math.max(b.north - b.south, 0.001) : 1;
@@ -1074,6 +1084,14 @@ export default function MapView({
         `;
       }
 
+      let facFlooded = false;
+      if (currentGrid && b) {
+        const r = Math.min(rows - 1, Math.max(0, Math.floor(((b.north - f.lat) / latSpan) * rows)));
+        const c = Math.min(cols - 1, Math.max(0, Math.floor(((f.lon - b.west) / lonSpan) * cols)));
+        const d = currentGrid[r]?.[c] ?? 0;
+        facFlooded = d >= hz.frameThreshold;
+      }
+
       const icon = L.divIcon({
         html: `<div class="map-symbol-pin ${pinClass}">${pinSvg}</div>`,
         className: 'custom-facility-pin-wrap',
@@ -1083,7 +1101,7 @@ export default function MapView({
 
       const marker = L.marker([f.lat, f.lon], { icon }).addTo(facilitiesLayerRef.current!);
       marker.bindTooltip(
-        `<b>${escapeHtml(f.name)}</b><br/><span style="font-size:11px;color:${f.flooded ? '#f59e0b' : '#38bdf8'}">${escapeHtml(f.type.toUpperCase())}${f.capacity ? ` • Cap: ${f.capacity}` : ''}${f.flooded ? ` (${hz.affectedWord} ALERT)` : ''}</span><br/><span style="font-size:10px;color:#94a3b8;">${escapeHtml(f.address || 'Click for full OSM contact & tags')}</span>`,
+        `<b>${escapeHtml(f.name)}</b><br/><span style="font-size:11px;color:${facFlooded ? '#f59e0b' : '#38bdf8'}">${escapeHtml(f.type.toUpperCase())}${f.capacity ? ` • Cap: ${f.capacity}` : ''}${facFlooded ? ` (${hz.affectedWord} ALERT)` : ''}</span><br/><span style="font-size:10px;color:#94a3b8;">${escapeHtml(f.address || 'Click for full OSM contact & tags')}</span>`,
         { direction: 'top', className: 'custom-map-tooltip' }
       );
       marker.on('click', () => {
@@ -1677,6 +1695,12 @@ export default function MapView({
           <Terrain3DViewer
             result={result}
             currentFrame={currentFrame}
+            setCurrentFrame={setCurrentFrame}
+            isPlaying={isPlaying}
+            setIsPlaying={setIsPlaying}
+            playSpeed={playSpeed}
+            setPlaySpeed={setPlaySpeed}
+            disasterType={disasterType}
             onClose={() => setIs3DMode(false)}
           />
         </Suspense>

@@ -72,67 +72,106 @@ class LandslideHazardModule(BaseHazardModule):
         # Avoid singular divide-by-zero on flat land
         theta = np.clip(slope_rad, np.radians(1.5), np.radians(65.0))
 
-        # Simulation across timesteps as rainfall progressively saturates the soil profile
-        num_frames = 6
-        timesteps = np.linspace(0.0, duration_hours, num_frames).tolist()
+        # Identify initial slope detachment source zones (SHALSTAB failure where FS <= 1.05 and slope >= 12°)
+        m_ratio = np.clip((rainfall_mm / 180.0) ** 1.1, 0.25, 0.96)
+        numerator = c_prime + (gamma - m_ratio * gamma_w) * z * (np.cos(theta)**2) * np.tan(phi_rad)
+        denominator = gamma * z * np.sin(theta) * np.cos(theta)
+        fs = numerator / np.maximum(denominator, 0.01)
+
+        source_scar = np.where(
+            (fs <= 1.10) & (slope_deg >= 10.0),
+            np.clip((1.15 - fs) / 0.40, 0.35, 1.0),
+            0.0
+        )
+        # If terrain has few extreme slopes, trigger on highest 10% slope cells if heavy rain
+        if np.max(source_scar) < 0.3 and rainfall_mm > 100.0:
+            high_slope_thresh = np.percentile(slope_deg, 90)
+            source_scar = np.where(
+                slope_deg >= max(8.0, high_slope_thresh),
+                np.clip((slope_deg - high_slope_thresh) / 10.0 + 0.4, 0.3, 0.85),
+                0.0
+            )
+
+        # Dynamic Debris Flow Runout Solver (Kinematic Wave downslope transport)
+        # In nature, landslides occur rapidly: failure -> debris avalanche -> deposition in 10-15 MINUTES
+        timesteps = [0.0, 2.0, 5.0, 8.0, 12.0, 15.0]  # minutes
+        timestep_labels = ["0 min", "2 min", "5 min", "8 min", "12 min", "15 min"]
         frames = []
 
+        # Find steepest downhill descent directions for all cells
+        dr = [-1, -1, -1,  0, 0,  1,  1,  1]
+        dc = [-1,  0,  1, -1, 1, -1,  0,  1]
+        dist_w = [1.414, 1.0, 1.414, 1.0, 1.0, 1.414, 1.0, 1.414]
+
+        # Downhill receiver map: receiver_r, receiver_c
+        receiver_r = np.arange(rows)[:, None].repeat(cols, axis=1)
+        receiver_c = np.arange(cols)[None, :].repeat(rows, axis=0)
+        max_down_slope = np.zeros((rows, cols), dtype=np.float64)
+
+        for k in range(8):
+            nr = np.clip(receiver_r + dr[k], 0, rows - 1)
+            nc = np.clip(receiver_c + dc[k], 0, cols - 1)
+            drop = (elevation - elevation[nr, nc]) / (dist_w[k] * resolution_m)
+            steeper = drop > max_down_slope
+            max_down_slope[steeper] = drop[steeper]
+            receiver_r[steeper] = nr[steeper]
+            receiver_c[steeper] = nc[steeper]
+
+        # Simulate progressive downslope debris propagation across the 15-minute event
+        current_debris = np.zeros((rows, cols), dtype=np.float64)
         max_hazard_lsi = np.zeros((rows, cols), dtype=np.float64)
 
-        for t in timesteps:
-            # Saturation fraction m(t): increases with cumulative rainfall
-            # Saturated hydraulic conductivity ~ 25 mm/h
-            rain_so_far = (t / max(duration_hours, 1.0)) * rainfall_mm
-            m_ratio = np.clip((rain_so_far / 180.0) ** 1.2, 0.05, 0.98)
+        for t_idx, t_min in enumerate(timesteps):
+            if t_idx == 0 or t_min <= 0.0:
+                frames.append(np.zeros((rows, cols), dtype=np.float64).tolist())
+                continue
 
-            # Infinite slope stability equation:
-            # Resisting shear stress:
-            numerator = c_prime + (gamma - m_ratio * gamma_w) * z * (np.cos(theta)**2) * np.tan(phi_rad)
-            # Driving shear stress:
-            denominator = gamma * z * np.sin(theta) * np.cos(theta)
-            fs = numerator / np.maximum(denominator, 0.01)
+            # Stage 1: Crown rupture and detachment (t = 2 min)
+            if t_idx == 1:
+                current_debris = source_scar.copy()
+            else:
+                # Stage 2-5: Debris flow avalanche cascades downslope along steepest gradient
+                next_debris = current_debris.copy()
+                # Transport debris to downstream receiver cells
+                for r in range(rows):
+                    for c in range(cols):
+                        val = current_debris[r, c]
+                        if val > 0.08 and max_down_slope[r, c] > 0.01:
+                            rr = receiver_r[r, c]
+                            cc = receiver_c[r, c]
+                            # Frictional damping coefficient
+                            down_val = val * 0.88
+                            if down_val > next_debris[rr, cc]:
+                                next_debris[rr, cc] = down_val
+                current_debris = np.maximum(next_debris, source_scar * 0.75)
 
-            # Map Factor of Safety to Landslide Susceptibility Index (0.0 to 1.0)
-            # FS > 1.5 -> LSI < 0.2 (Stable)
-            # FS < 1.0 -> LSI = 1.0 (Failure)
-            lsi = np.where(
-                fs >= 1.6,
-                0.1,
-                np.where(
-                    fs >= 1.2,
-                    0.35 + 0.25 * (1.6 - fs) / 0.4,
-                    np.where(
-                        fs >= 1.0,
-                        0.65 + 0.25 * (1.2 - fs) / 0.2,
-                        1.0  # Failure / critical
-                    )
-                )
-            )
-            # On flat ground (slope < 5°), landslides cannot occur
-            flat_mask = slope_deg < 5.0
-            lsi[flat_mask] = 0.0
+            current_frame_lsi = np.clip(current_debris, 0.0, 1.0)
+            frames.append(np.round(current_frame_lsi, 2).tolist())
+            max_hazard_lsi = np.maximum(max_hazard_lsi, current_frame_lsi)
 
-            frames.append(np.round(lsi, 2).tolist())
-            max_hazard_lsi = np.maximum(max_hazard_lsi, lsi)
-
-        critical_cells = np.sum(max_hazard_lsi >= 0.7)
+        critical_cells = np.sum(max_hazard_lsi >= 0.6)
         unstable_area_km2 = float(critical_cells * (resolution_m**2) / 1e6)
 
         return HazardOutput(
             disaster_type="landslide",
-            model_name=self.model_name,
-            timesteps=[round(t, 2) for t in timesteps],
+            model_name="SHALSTAB & Kinematic Debris Flow Runout Solver",
+            timesteps=timesteps,
             frames=frames,
             max_hazard=np.round(max_hazard_lsi, 2).tolist(),
             rows=rows,
             cols=cols,
             hazard_unit="Landslide Susceptibility Index (0-1.0)",
-            threshold_impact=0.65,  # High susceptibility threshold
-            total_time_hours=duration_hours,
+            threshold_impact=0.60,
+            total_time_hours=round(15.0 / 60.0, 3),  # 0.25h for legacy compatibility
+            time_unit="minutes",
+            total_time=15.0,
+            timestep_labels=timestep_labels,
             metadata={
-                "rainfall_mm": rainfall_mm,
+                "antecedent_rainfall_mm": rainfall_mm,
                 "duration_hours": duration_hours,
+                "event_duration_min": 15.0,
                 "unstable_area_km2": round(unstable_area_km2, 2),
                 "peak_susceptibility": round(float(np.max(max_hazard_lsi)), 2),
+                "model": "SHALSTAB Failure Initiation + Dynamic Valley Runout",
             },
         )

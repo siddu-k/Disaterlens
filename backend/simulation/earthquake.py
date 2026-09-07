@@ -105,16 +105,19 @@ class EarthquakeHazardModule(BaseHazardModule):
         )
         mmi = np.clip(np.round(mmi, 2), 1.0, 10.0)
 
-        # Animate seismic wave propagation across 6 timesteps (P and S wave envelope arrival)
-        # S-wave shear velocity ~ 3.5 km/s
+        # Animate seismic wave propagation across 6 timesteps in real-time SECONDS
+        # S-wave shear velocity ~ 3.5 km/s (primary shaking envelope arrival)
         v_s = 3.5  # km/s
-        max_dist = np.max(r_hyp_km)
-        wave_travel_time = max_dist / v_s  # seconds
         
-        timesteps = [0.0, 0.02, 0.05, 0.10, 0.15, 0.25]  # hours
+        # Real-world seismic event duration: 0s to 90s (rupture + P/S wavefront + basin shaking)
+        timesteps = [0.0, 15.0, 30.0, 45.0, 60.0, 90.0]  # seconds
+        timestep_labels = ["0s", "15s", "30s", "45s", "60s", "90s"]
         frames = []
-        for t_idx, t_h in enumerate(timesteps):
-            t_sec = t_h * 3600.0
+        for t_idx, t_sec in enumerate(timesteps):
+            if t_idx == 0 or t_sec <= 0.0:
+                # Initial baseline at t=0 before seismic rupture arrival
+                frames.append(np.zeros_like(mmi).tolist())
+                continue
             wavefront_radius = max(depth_km, t_sec * v_s)
             
             # Attenuated envelope up to current wavefront radius
@@ -133,12 +136,16 @@ class EarthquakeHazardModule(BaseHazardModule):
             cols=cols,
             hazard_unit="MMI (Intensity I-X)",
             threshold_impact=6.0,  # MMI VI is where building cracking and road damage initiates
-            total_time_hours=timesteps[-1],
+            total_time_hours=round(90.0 / 3600.0, 4),  # 0.025h for legacy compatibility
+            time_unit="seconds",
+            total_time=90.0,
+            timestep_labels=timestep_labels,
             metadata={
                 "magnitude": mag,
                 "depth_km": depth_km,
                 "epicenter": {"lat": epicenter_lat, "lon": epicenter_lon},
                 "peak_pga_g": round(float(np.max(pga_g)), 3),
                 "peak_mmi": round(float(np.max(mmi)), 1),
+                "event_duration_sec": 90.0,
             },
         )

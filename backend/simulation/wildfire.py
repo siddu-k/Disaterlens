@@ -128,14 +128,15 @@ class WildfireHazardModule(BaseHazardModule):
         max_severity = np.zeros((rows, cols), dtype=np.float64)
 
         for t in timesteps:
-            # Burn severity index: 1.0 for active fire, 0.7 for smoldering burn scar
-            burned_mask = arrival_time_h <= t
             severity = np.zeros((rows, cols), dtype=np.float64)
-            # Active flame front: reached within last 2 hours
-            active_mask = burned_mask & (arrival_time_h >= max(0.0, t - 2.0))
-            scar_mask = burned_mask & (arrival_time_h < max(0.0, t - 2.0))
-            severity[scar_mask] = 0.65
-            severity[active_mask] = 1.0
+            if t > 0.0:
+                # Burn severity index: 1.0 for active fire, 0.7 for smoldering burn scar
+                burned_mask = arrival_time_h <= t
+                # Active flame front: reached within last 2 hours
+                active_mask = burned_mask & (arrival_time_h >= max(0.0, t - 2.0))
+                scar_mask = burned_mask & (arrival_time_h < max(0.0, t - 2.0))
+                severity[scar_mask] = 0.65
+                severity[active_mask] = 1.0
 
             frames.append(np.round(severity, 2).tolist())
             max_severity = np.maximum(max_severity, severity)
@@ -151,6 +152,9 @@ class WildfireHazardModule(BaseHazardModule):
             hazard_unit="Burn Severity Index (0-1.0)",
             threshold_impact=0.5,
             total_time_hours=duration_hours,
+            time_unit="hours",
+            total_time=duration_hours,
+            timestep_labels=[f"{round(t, 1)}h" for t in timesteps],
             metadata={
                 "wind_speed_kmh": wind_speed_kmh,
                 "wind_direction_deg": wind_dir_deg,
