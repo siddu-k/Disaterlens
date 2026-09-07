@@ -19,9 +19,12 @@ References:
 
 import numpy as np
 import math
+import logging
 from typing import Dict, Any, List, Tuple, Optional
 import config
 from simulation.base import BaseHazardModule, HazardOutput
+
+logger = logging.getLogger(__name__)
 
 
 class FloodHazardModule(BaseHazardModule):
@@ -89,9 +92,16 @@ class FloodHazardModule(BaseHazardModule):
         elev_range = max(float(np.nanmax(elevation) - min_elev), 1.0)
         coastal_mask = (elevation < (min_elev + elev_range * 0.12)) if sea_level_surge_m > 0 else np.zeros((rows, cols), dtype=bool)
 
-        # Ensure total simulation time spans EXACTLY duration_hours
-        total_steps = min(600, max(24, int(duration_s / 90.0)))
-        dt = duration_s / float(total_steps)
+        # Ensure total simulation time spans EXACTLY duration_hours.
+        # Honor caller-supplied dt; clamp total steps for performance.
+        # Output sampling keeps today's ~16-frame behavior (frontend reads
+        # the frames array dynamically, so exact count is not contractual).
+        if dt <= 0:
+            dt = float(config.DEFAULT_TIME_STEP)
+        total_steps = max(1, int(round(duration_s / dt)))
+        if total_steps > 600:
+            total_steps = 600
+            dt = duration_s / float(total_steps)
         output_step = max(1, total_steps // 16)
 
         frames = []

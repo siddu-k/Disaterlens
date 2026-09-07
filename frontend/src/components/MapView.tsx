@@ -1,8 +1,86 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, lazy, Suspense } from 'react';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import { BoundingBox, SimulationResult, RoadFeature, Facility, BuildingFeature, EvacuationRoute } from '../types';
-import Terrain3DViewer from './Terrain3DViewer';
+import {
+  IconFlood,
+  IconCyclone,
+  IconHeatwave,
+  IconEarthquake,
+  IconLandslide,
+  IconBuilding,
+  IconRoad,
+  IconHospital,
+  IconShelter,
+  IconPolice,
+  IconLocationPin,
+  IconTag,
+  IconPencil,
+} from './Icons';
+
+const Terrain3DViewer = lazy(() => import('./Terrain3DViewer'));
+
+// Escape OSM-derived strings before interpolating into Leaflet tooltip HTML.
+function escapeHtml(value: unknown): string {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+    .replace(/=/g, '&#61;')
+    .replace(/\//g, '&#47;');
+}
+
+// Only http(s) URLs may render as clickable links; anything else is plain text.
+function isSafeHttpUrl(url: string): boolean {
+  return url.startsWith('http://') || url.startsWith('https://');
+}
+
+// Per-hazard display vocabulary: per-frame marker thresholds, status words, units.
+// Frame thresholds mirror backend analysis/impact.py building bands.
+function hazardDisplay(disasterType?: string) {
+  switch (disasterType) {
+    case 'earthquake':
+      return { unit: 'MMI', affectedWord: 'DAMAGED', clearWord: 'INTACT', frameThreshold: 6.0 };
+    case 'wildfire':
+      return { unit: 'severity', affectedWord: 'BURNING', clearWord: 'UNBURNED', frameThreshold: 0.35 };
+    case 'landslide':
+      return { unit: 'LSI', affectedWord: 'AT RISK', clearWord: 'STABLE', frameThreshold: 0.5 };
+    case 'cyclone':
+      return { unit: 'km/h', affectedWord: 'WIND-DAMAGED', clearWord: 'SECURE', frameThreshold: 90 };
+    default:
+      return { unit: 'm', affectedWord: 'FLOODED', clearWord: 'SAFE (DRY)', frameThreshold: 0.08 };
+  }
+}
+
+// Viewport-culling + zoom-gating budgets (prevents tab freeze on large AOIs).
+const MAX_VISIBLE_ROADS = 400;
+const MAX_VISIBLE_BUILDINGS = 600;
+const BUILDINGS_MIN_ZOOM = 14; // buildings render only when zoomed to street level
+const ROAD_GLOW_MIN_ZOOM = 13; // dual-stroke glow only when zoomed in (halves objects)
+
+function statusRank(status?: string): number {
+  if (status === 'closed') return 2;
+  if (status === 'restricted') return 1;
+  return 0;
+}
+
+// Per-frame road status thresholds per hazard (mirrors backend thresholds).
+function roadStatusThresholds(disasterType?: string): { closed: number; restricted: number } {
+  switch (disasterType) {
+    case 'earthquake':
+      return { closed: 7.8, restricted: 6.5 };
+    case 'wildfire':
+      return { closed: 0.65, restricted: 0.35 };
+    case 'landslide':
+      return { closed: 0.75, restricted: 0.5 };
+    case 'cyclone':
+      return { closed: 130, restricted: 90 };
+    default:
+      return { closed: 0.45, restricted: 0.15 };
+  }
+}
 
 interface MapViewProps {
   mapMode: 'satellite' | 'map';
@@ -16,6 +94,9 @@ interface MapViewProps {
   setSelectedRoad: (road: RoadFeature | null) => void;
   disasterType?: string;
   setDisasterType?: (d: any) => void;
+  focusedFacility?: { fac: Facility; nonce: number } | null;
+  buildingDensity?: 'medium' | 'maximum';
+  isPlaying?: boolean;
 }
 
 const TILE_URLS = {
@@ -32,7 +113,7 @@ function RawTagsViewer({ tags }: { tags?: Record<string, any> }) {
   return (
     <div className="osm-raw-tags-container">
       <div className="osm-raw-tags-header" onClick={() => setExpanded(!expanded)}>
-        <span>🏷️ All OpenStreetMap Tags ({entries.length})</span>
+        <span><IconTag size={13} className="svg-icon-inline" /> All OpenStreetMap Tags ({entries.length})</span>
         <span style={{ fontSize: '10.5px', color: '#38bdf8' }}>{expanded ? '▲ Hide' : '▼ Show All'}</span>
       </div>
       {expanded && (
@@ -242,7 +323,11 @@ export default function MapView({
   setSelectedRoad,
   disasterType,
   setDisasterType,
+  focusedFacility,
+  buildingDensity,
+  isPlaying,
 }: MapViewProps) {
+  const hz = hazardDisplay(disasterType);
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<L.Map | null>(null);
   const tileLayerRef = useRef<L.TileLayer | null>(null);
@@ -254,16 +339,28 @@ export default function MapView({
   const bboxRectRef = useRef<L.Rectangle | null>(null);
   const lastRunUuidRef = useRef<string>('');
   const landmarksLayerRef = useRef<L.LayerGroup | null>(null);
+  // Cache of rendered hazard overlay dataURLs per frame (cap 64, evict oldest).
+  const hazardDataUrlCacheRef = useRef<Map<number, string>>(new Map());
+  // Tracks which run_uuid the vector camera fit already ran for (skip refit on frame scrub).
+  const vectorFitDoneForRunRef = useRef<string>('');
+  // Playback freeze guard: while the timeline plays, frames advance every ~700ms.
+  // Rebuilding thousands of vectors per tick locks the tab — skip it and let the
+  // hazard overlay (separate effect) carry the animation. Vectors refresh on pause.
+  const vectorRenderKeyRef = useRef<string>('');
+  const viewportTimerRef = useRef<number | null>(null);
 
   const [isDrawing, setIsDrawing] = useState(false);
   const isDrawingRef = useRef(false);
   const [selectedFacility, setSelectedFacility] = useState<Facility | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [selectedBuilding, setSelectedBuilding] = useState<BuildingFeature | null>(null);
   const [is3DMode, setIs3DMode] = useState<boolean>(false);
   const [showOsmModal, setShowOsmModal] = useState<boolean>(false);
   const [showStreetViewPanel, setShowStreetViewPanel] = useState<boolean>(true);
   const buildingCanvasRef = useRef<L.Canvas | null>(null);
   const [mapZoom, setMapZoom] = useState<number>(13);
+  // Current visible map bounds — vectors render only inside it (plus small margin).
+  const [mapViewport, setMapViewport] = useState<{ south: number; north: number; west: number; east: number } | null>(null);
 
   // Initialize Map
   useEffect(() => {
@@ -311,14 +408,15 @@ export default function MapView({
 
       this._fillStroke(ctx, layer);
 
-      // If glyph symbol is provided, render emoji/symbol cleanly on canvas
+      // If a letter-code symbol is provided, render it cleanly on canvas
       if (layer.options && layer.options.glyph) {
         ctx.save();
         const fontSize = Math.max(9, Math.round(r * 1.3));
-        ctx.font = `${fontSize}px "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji", sans-serif`;
+        ctx.font = `700 ${fontSize}px Inter, system-ui, sans-serif`;
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
         ctx.globalAlpha = 1.0;
+        ctx.fillStyle = '#ffffff';
         ctx.fillText(layer.options.glyph, p.x, p.y + 1);
         ctx.restore();
       }
@@ -331,9 +429,21 @@ export default function MapView({
     routesLayerRef.current = L.layerGroup().addTo(map);
     landmarksLayerRef.current = L.layerGroup().addTo(map);
 
+    // Track camera (zoom + pan) so vectors render only for the visible viewport.
+    const updateViewport = () => {
+      if (viewportTimerRef.current) window.clearTimeout(viewportTimerRef.current);
+      viewportTimerRef.current = window.setTimeout(() => {
+        if (!mapRef.current) return;
+        const bds = mapRef.current.getBounds();
+        setMapViewport({ south: bds.getSouth(), north: bds.getNorth(), west: bds.getWest(), east: bds.getEast() });
+      }, 150);
+    };
     map.on('zoomend', () => {
       setMapZoom(map.getZoom());
+      updateViewport();
     });
+    map.on('moveend', updateViewport);
+    updateViewport();
 
     mapRef.current = map;
 
@@ -396,6 +506,7 @@ export default function MapView({
     map.on('mouseup', onMouseUp);
 
     return () => {
+      if (viewportTimerRef.current) window.clearTimeout(viewportTimerRef.current);
       map.off('mousedown', onMouseDown);
       map.off('mousemove', onMouseMove);
       map.off('mouseup', onMouseUp);
@@ -409,6 +520,16 @@ export default function MapView({
     if (!tileLayerRef.current) return;
     tileLayerRef.current.setUrl(TILE_URLS[mapMode]);
   }, [mapMode]);
+
+  // Sidebar "Nearby Facilities" click-to-locate: open the facility inspector + fly to it.
+  useEffect(() => {
+    if (!focusedFacility || !mapRef.current) return;
+    const { fac } = focusedFacility;
+    if (typeof fac?.lat !== 'number' || typeof fac?.lon !== 'number') return;
+    setSelectedFacility(fac);
+    setSelectedRoad(null);
+    mapRef.current.flyTo([fac.lat, fac.lon], Math.max(mapRef.current.getZoom(), 15), { duration: 0.8 });
+  }, [focusedFacility]);
 
   // Sync AOI Rectangle
   useEffect(() => {
@@ -467,6 +588,7 @@ export default function MapView({
     const isNewRun = result.run_uuid && result.run_uuid !== lastRunUuidRef.current;
     if (isNewRun) {
       lastRunUuidRef.current = result.run_uuid;
+      hazardDataUrlCacheRef.current.clear();
       if (hazardLayerRef.current && mapRef.current) {
         mapRef.current.removeLayer(hazardLayerRef.current);
         hazardLayerRef.current = null;
@@ -479,12 +601,22 @@ export default function MapView({
     const cols = sim.cols;
     const disaster = sim.disaster_type || 'flood';
 
-    // Render offscreen canvas with bilinear upsampling and fluid wave texture (512x512)
-    const canvas = renderHazardCanvas(grid, rows, cols, disaster, 512, 512);
-
     const b = result.bbox;
     const bounds = L.latLngBounds([b.south, b.west], [b.north, b.east]);
-    const dataUrl = canvas.toDataURL();
+
+    // Reuse cached overlay when scrubbing back to an already-rendered frame.
+    let dataUrl = hazardDataUrlCacheRef.current.get(frameIdx);
+    if (!dataUrl) {
+      // Render offscreen canvas with bilinear upsampling and fluid wave texture (512x512)
+      const canvas = renderHazardCanvas(grid, rows, cols, disaster, 512, 512);
+      dataUrl = canvas.toDataURL();
+      const cache = hazardDataUrlCacheRef.current;
+      if (cache.size >= 64) {
+        const oldest = cache.keys().next();
+        if (!oldest.done) cache.delete(oldest.value);
+      }
+      cache.set(frameIdx, dataUrl);
+    }
 
     if (hazardLayerRef.current) {
       hazardLayerRef.current.setUrl(dataUrl);
@@ -504,12 +636,60 @@ export default function MapView({
 
     if (!result) return;
 
-    const roads = result.geodata?.roads || [];
-    const buildings = result.geodata?.buildings || [];
+    const allRoads = result.geodata?.roads || [];
+    const allBuildings = result.geodata?.buildings || [];
     const facilities = result.impact?.facilities || [];
 
-    // Auto-focus map camera on all roads inside the AOI for new simulation runs
-    if (result.run_uuid && result.run_uuid !== lastRunUuidRef.current && roads.length > 0 && mapRef.current) {
+    // Playback guard (see ref comment above): same scene + playing ⇒ keep layers.
+    const vpKey = mapViewport
+      ? `${mapViewport.south.toFixed(4)},${mapViewport.west.toFixed(4)},${mapViewport.north.toFixed(4)},${mapViewport.east.toFixed(4)}`
+      : 'novp';
+    const renderKey = `${result.run_uuid || 'noid'}-${mapZoom}-${buildingDensity || 'medium'}-${vpKey}`;
+    if (isPlaying && vectorRenderKeyRef.current === renderKey) return;
+    vectorRenderKeyRef.current = renderKey;
+
+    // Viewport culling: render only features the user can actually see (+10% margin
+    // so markers don't pop at the edges). Falls back to everything until the
+    // viewport is known (first load).
+    const vp = mapViewport;
+    const padLat = vp ? (vp.north - vp.south) * 0.1 : 0;
+    const padLon = vp ? (vp.east - vp.west) * 0.1 : 0;
+    const inView = (lat: number, lon: number) =>
+      !vp ||
+      (lat >= vp.south - padLat && lat <= vp.north + padLat && lon >= vp.west - padLon && lon <= vp.east + padLon);
+    const roadInView = (r: RoadFeature) => {
+      if (!vp) return true;
+      const pts: { lat: number; lon: number }[] = [];
+      if (r.midpoint) pts.push(r.midpoint);
+      if (r.coords && r.coords.length > 0) {
+        pts.push({ lat: r.coords[0][1], lon: r.coords[0][0] });
+        pts.push({ lat: r.coords[r.coords.length - 1][1], lon: r.coords[r.coords.length - 1][0] });
+      }
+      return pts.some((p) => p && inView(p.lat, p.lon));
+    };
+
+    // Closed/restricted first so critical info survives the render cap.
+    const roads = allRoads
+      .filter(roadInView)
+      .sort((a, b) => statusRank(b.status) - statusRank(a.status))
+      .slice(0, MAX_VISIBLE_ROADS);
+    // Buildings: Maximum renders every house in view; Medium gates to street
+    // zoom with a cap (keeps large areas fluid). Viewport culling always applies.
+    const fullDensity = (buildingDensity || 'medium') === 'maximum';
+    const showBuildings = fullDensity || mapZoom >= BUILDINGS_MIN_ZOOM;
+    const buildings = !showBuildings
+      ? []
+      : fullDensity
+        ? allBuildings.filter((bldg) => !vp || (bldg.centroid && inView(bldg.centroid.lat, bldg.centroid.lon)))
+        : allBuildings
+            .filter((bldg) => bldg.centroid && inView(bldg.centroid.lat, bldg.centroid.lon))
+            .sort((a, b) => Number(b.affected || b.flooded) - Number(a.affected || a.flooded))
+            .slice(0, MAX_VISIBLE_BUILDINGS);
+
+    // Auto-focus map camera on all roads inside the AOI for new simulation runs.
+    // Dedicated ref (never updated by the hazard effect): frame scrubbing must never refit the camera.
+    if (result.run_uuid && result.run_uuid !== vectorFitDoneForRunRef.current && allRoads.length > 0 && mapRef.current) {
+      vectorFitDoneForRunRef.current = result.run_uuid;
       const targetBbox = result.aoi_bbox || result.bbox;
       if (targetBbox) {
         mapRef.current.fitBounds([
@@ -528,6 +708,7 @@ export default function MapView({
     const lonSpan = b ? Math.max(b.east - b.west, 0.001) : 1;
     const rows = sim?.rows || 1;
     const cols = sim?.cols || 1;
+    const roadTh = roadStatusThresholds(sim?.disaster_type);
 
     // Helper function to resolve building category & symbol (Known types get symbol, generic get dot)
     const resolveBuildingSymbol = (rawType: string, isAffected: boolean) => {
@@ -537,34 +718,34 @@ export default function MapView({
       }
 
       if (t.includes('resident') || t.includes('apart') || t.includes('house') || t.includes('flat') || t.includes('terrace') || t.includes('dorm')) {
-        return { glyph: '🏠', label: 'Residential', color: isAffected ? '#ef4444' : '#60a5fa' };
+        return { glyph: 'H', label: 'Residential', color: isAffected ? '#ef4444' : '#60a5fa' };
       }
       if (t.includes('commerc') || t.includes('office') || t.includes('retail') || t.includes('bank') || t.includes('store') || t.includes('shop')) {
-        return { glyph: '🏢', label: 'Commercial / Office', color: isAffected ? '#ef4444' : '#38bdf8' };
+        return { glyph: 'C', label: 'Commercial / Office', color: isAffected ? '#ef4444' : '#38bdf8' };
       }
       if (t.includes('school') || t.includes('colleg') || t.includes('univers') || t.includes('kinder') || t.includes('educat')) {
-        return { glyph: '🎓', label: 'Education', color: isAffected ? '#ef4444' : '#a855f7' };
+        return { glyph: 'E', label: 'Education', color: isAffected ? '#ef4444' : '#a855f7' };
       }
       if (t.includes('hosp') || t.includes('clinic') || t.includes('medic') || t.includes('doctor') || t.includes('pharm')) {
-        return { glyph: '🏥', label: 'Healthcare', color: isAffected ? '#ef4444' : '#f43f5e' };
+        return { glyph: 'M', label: 'Healthcare', color: isAffected ? '#ef4444' : '#f43f5e' };
       }
       if (t.includes('indust') || t.includes('wareh') || t.includes('factor') || t.includes('work') || t.includes('plant')) {
-        return { glyph: '🏭', label: 'Industrial', color: isAffected ? '#ef4444' : '#fb923c' };
+        return { glyph: 'I', label: 'Industrial', color: isAffected ? '#ef4444' : '#fb923c' };
       }
       if (t.includes('worship') || t.includes('temple') || t.includes('church') || t.includes('mosque') || t.includes('relig')) {
-        return { glyph: '🏛️', label: 'Place of Worship', color: isAffected ? '#ef4444' : '#eab308' };
+        return { glyph: 'W', label: 'Place of Worship', color: isAffected ? '#ef4444' : '#eab308' };
       }
       if (t.includes('civic') || t.includes('gov') || t.includes('public') || t.includes('police') || t.includes('fire')) {
-        return { glyph: '🏛️', label: 'Public / Civic', color: isAffected ? '#ef4444' : '#10b981' };
+        return { glyph: 'G', label: 'Public / Civic', color: isAffected ? '#ef4444' : '#10b981' };
       }
       if (t.includes('hotel') || t.includes('motel') || t.includes('guest') || t.includes('hostel')) {
-        return { glyph: '🏨', label: 'Hotel / Lodging', color: isAffected ? '#ef4444' : '#06b6d4' };
+        return { glyph: 'L', label: 'Hotel / Lodging', color: isAffected ? '#ef4444' : '#06b6d4' };
       }
 
-      return { glyph: '🏷️', label: rawType, color: isAffected ? '#ef4444' : '#38bdf8' };
+      return { glyph: 'T', label: rawType, color: isAffected ? '#ef4444' : '#38bdf8' };
     };
 
-    // 1. Render ALL Buildings on GPU-accelerated Canvas with smart spatial decluttering (0 DOM lag)
+    // 1. Render visible Buildings on GPU-accelerated Canvas with smart spatial decluttering (0 DOM lag)
     const placedBadgePixelCoords: { x: number; y: number }[] = [];
     const minBadgeSpacing = 24; // Screen pixel separation to prevent solid overlapping clusters
 
@@ -576,7 +757,7 @@ export default function MapView({
         const r = Math.min(rows - 1, Math.max(0, Math.floor(((b.north - bldg.centroid.lat) / latSpan) * rows)));
         const c = Math.min(cols - 1, Math.max(0, Math.floor(((bldg.centroid.lon - b.west) / lonSpan) * cols)));
         depth = currentGrid[r]?.[c] ?? 0;
-        isAffected = depth > 0.08;
+        isAffected = depth >= hz.frameThreshold;
       } else {
         isAffected = bldg.flooded;
         depth = bldg.flood_depth || 0;
@@ -636,9 +817,9 @@ export default function MapView({
       marker.addTo(buildingsLayerRef.current!);
 
       marker.bindTooltip(
-        `<strong>${bldg.name || `OSM Structure #${bldg.id}`}</strong><br/>
-         <span style="color:${isAffected ? '#f87171' : '#38bdf8'};font-weight:700;">${isAffected ? `FLOODED (${depth.toFixed(2)}m)` : 'SAFE (DRY)'}</span><br/>
-         Type: <code>${symbolInfo ? symbolInfo.label : (bldg.type || 'General Structure')}</code> • Area: ${bldg.area_sqm} m² ${bldg.levels ? `• ${bldg.levels} Fl` : ''}`,
+        `<strong>${escapeHtml(bldg.name || `OSM Structure #${bldg.id}`)}</strong><br/>
+         <span style="color:${isAffected ? '#f87171' : '#38bdf8'};font-weight:700;">${isAffected ? `${escapeHtml(bldg.damage_state && !['None', 'Unaffected'].includes(bldg.damage_state) ? bldg.damage_state.toUpperCase() : hz.affectedWord)} (${(bldg.hazard_severity ?? depth).toFixed(2)} ${hz.unit})` : hz.clearWord}</span><br/>
+         Type: <code>${escapeHtml(symbolInfo ? symbolInfo.label : (bldg.type || 'General Structure'))}</code> • Area: ${bldg.area_sqm} m² ${bldg.levels ? `• ${bldg.levels} Fl` : ''}`,
         { sticky: true, className: 'custom-map-tooltip' }
       );
 
@@ -660,8 +841,8 @@ export default function MapView({
         const r = Math.min(rows - 1, Math.max(0, Math.floor(((b.north - road.midpoint.lat) / latSpan) * rows)));
         const c = Math.min(cols - 1, Math.max(0, Math.floor(((road.midpoint.lon - b.west) / lonSpan) * cols)));
         const depth = currentGrid[r]?.[c] ?? 0;
-        if (depth >= 0.45) status = 'closed';
-        else if (depth >= 0.15) status = 'restricted';
+        if (depth >= roadTh.closed) status = 'closed';
+        else if (depth >= roadTh.restricted) status = 'restricted';
         else status = 'open';
       } else {
         status = road.status;
@@ -674,16 +855,19 @@ export default function MapView({
       const baseWeight = isMajor ? 3.8 : isSecondary ? 2.8 : 2.0;
 
       const elevLabel = road.elevation_m !== undefined 
-        ? `<br/><span style="color:#38bdf8;font-weight:600;">🏔️ Elevation: ${road.elevation_m.toFixed(1)}m ASL ${road.min_elevation_m !== undefined ? `(Min: ${road.min_elevation_m.toFixed(1)}m, Max: ${road.max_elevation_m?.toFixed(1)}m)` : ''} • Slope: ${road.slope_pct !== undefined ? road.slope_pct.toFixed(1) : 0}%</span>`
+        ? `<br/><span style="color:#38bdf8;font-weight:600;">Elevation: ${road.elevation_m.toFixed(1)}m ASL ${road.min_elevation_m !== undefined ? `(Min: ${road.min_elevation_m.toFixed(1)}m, Max: ${road.max_elevation_m?.toFixed(1)}m)` : ''} • Slope: ${road.slope_pct !== undefined ? road.slope_pct.toFixed(1) : 0}%</span>`
         : '';
 
       if (isClosed) {
-        // Dual-stroke illuminated neon red glow
-        L.polyline(pts, {
-          color: '#ef4444',
-          weight: baseWeight * 2.2,
-          opacity: 0.40,
-        }).addTo(roadsLayerRef.current!);
+        // Dual-stroke illuminated neon red glow (skipped when zoomed out: halves objects)
+        if (mapZoom >= ROAD_GLOW_MIN_ZOOM) {
+          L.polyline(pts, {
+            color: '#ef4444',
+            weight: baseWeight * 2.2,
+            opacity: 0.40,
+            interactive: false,
+          }).addTo(roadsLayerRef.current!);
+        }
 
         const poly = L.polyline(pts, {
           color: '#f87171',
@@ -692,7 +876,7 @@ export default function MapView({
         }).addTo(roadsLayerRef.current!);
 
         poly.bindTooltip(
-          `<strong>${road.name}</strong><br/><span style="color:#ef4444;font-weight:700;">CLOSED (IMPASSABLE)</span> • ${(road.length_m / 1000).toFixed(2)} km${elevLabel}<br/><span style="font-size:10px;color:#94a3b8;">Highway: ${road.type} • Lanes: ${road.lanes || 'Default'} • Surface: ${road.surface || 'Paved'}</span>`,
+          `<strong>${escapeHtml(road.name)}</strong><br/><span style="color:#ef4444;font-weight:700;">CLOSED (IMPASSABLE)</span> • ${(road.length_m / 1000).toFixed(2)} km${elevLabel}<br/><span style="font-size:10px;color:#94a3b8;">Highway: ${escapeHtml(road.type)} • Lanes: ${escapeHtml(road.lanes || 'Default')} • Surface: ${escapeHtml(road.surface || 'Paved')}</span>`,
           { sticky: true, className: 'custom-map-tooltip' }
         );
         poly.on('click', () => {
@@ -705,12 +889,15 @@ export default function MapView({
           closedRoadsForBadging.push({ ...road, status });
         }
       } else if (isRestricted) {
-        // Dual-stroke warning amber glow
-        L.polyline(pts, {
-          color: '#f59e0b',
-          weight: baseWeight * 1.8,
-          opacity: 0.35,
-        }).addTo(roadsLayerRef.current!);
+        // Dual-stroke warning amber glow (skipped when zoomed out: halves objects)
+        if (mapZoom >= ROAD_GLOW_MIN_ZOOM) {
+          L.polyline(pts, {
+            color: '#f59e0b',
+            weight: baseWeight * 1.8,
+            opacity: 0.35,
+            interactive: false,
+          }).addTo(roadsLayerRef.current!);
+        }
 
         const poly = L.polyline(pts, {
           color: '#fbbf24',
@@ -719,7 +906,7 @@ export default function MapView({
         }).addTo(roadsLayerRef.current!);
 
         poly.bindTooltip(
-          `<strong>${road.name}</strong><br/><span style="color:#f59e0b;font-weight:700;">RESTRICTED ACCESS</span> • ${(road.length_m / 1000).toFixed(2)} km${elevLabel}<br/><span style="font-size:10px;color:#94a3b8;">Highway: ${road.type} • Lanes: ${road.lanes || 'Default'} • Surface: ${road.surface || 'Paved'}</span>`,
+          `<strong>${escapeHtml(road.name)}</strong><br/><span style="color:#f59e0b;font-weight:700;">RESTRICTED ACCESS</span> • ${(road.length_m / 1000).toFixed(2)} km${elevLabel}<br/><span style="font-size:10px;color:#94a3b8;">Highway: ${escapeHtml(road.type)} • Lanes: ${escapeHtml(road.lanes || 'Default')} • Surface: ${escapeHtml(road.surface || 'Paved')}</span>`,
           { sticky: true, className: 'custom-map-tooltip' }
         );
         poly.on('click', () => {
@@ -729,11 +916,12 @@ export default function MapView({
         });
       } else {
         // Crisp open green corridor with clear hierarchy
-        if (isMajor) {
+        if (isMajor && mapZoom >= ROAD_GLOW_MIN_ZOOM) {
           L.polyline(pts, {
             color: '#059669',
             weight: baseWeight * 1.6,
             opacity: 0.28,
+            interactive: false,
           }).addTo(roadsLayerRef.current!);
         }
 
@@ -744,7 +932,7 @@ export default function MapView({
         }).addTo(roadsLayerRef.current!);
 
         poly.bindTooltip(
-          `<strong>${road.name}</strong><br/><span style="color:#10b981;font-weight:700;">OPEN (CLEAR)</span> • ${(road.length_m / 1000).toFixed(2)} km${elevLabel}<br/><span style="font-size:10px;color:#94a3b8;">Highway: ${road.type} • Lanes: ${road.lanes || 'Default'} • Surface: ${road.surface || 'Paved'}</span>`,
+          `<strong>${escapeHtml(road.name)}</strong><br/><span style="color:#10b981;font-weight:700;">OPEN (CLEAR)</span> • ${(road.length_m / 1000).toFixed(2)} km${elevLabel}<br/><span style="font-size:10px;color:#94a3b8;">Highway: ${escapeHtml(road.type)} • Lanes: ${escapeHtml(road.lanes || 'Default')} • Surface: ${escapeHtml(road.surface || 'Paved')}</span>`,
           { sticky: true, className: 'custom-map-tooltip' }
         );
         poly.on('click', () => {
@@ -776,7 +964,7 @@ export default function MapView({
 
     chosenBadges.forEach((r, idx) => {
       const isNoEntry = idx % 2 === 1;
-      const iconHtml = `<div class="map-closure-alert-circle" title="${r.name} - Road Closed">${isNoEntry ? '<span class="alert-bar"></span>' : '!'}</div>`;
+      const iconHtml = `<div class="map-closure-alert-circle" title="${escapeHtml(r.name)} - Road Closed">${isNoEntry ? '<span class="alert-bar"></span>' : '!'}</div>`;
       const closureIcon = L.divIcon({
         html: iconHtml,
         className: 'custom-closure-icon',
@@ -785,8 +973,12 @@ export default function MapView({
       });
       L.marker([r.midpoint!.lat, r.midpoint!.lon], { icon: closureIcon })
         .addTo(roadsLayerRef.current!)
+        .bindTooltip(
+          `<strong>${escapeHtml(r.name)}</strong><br/><span style="color:#ef4444;font-weight:700;">CLOSED (IMPASSABLE)</span><br/><span style="font-size:10px;color:#94a3b8;">Click for full OSM road inspector</span>`,
+          { direction: 'top', className: 'custom-map-tooltip' }
+        )
         .on('click', () => {
-          setSelectedRoad(r);
+          setSelectedRoad({ ...r, status: r.status });
           setSelectedFacility(null);
           setSelectedBuilding(null);
         });
@@ -891,7 +1083,7 @@ export default function MapView({
 
       const marker = L.marker([f.lat, f.lon], { icon }).addTo(facilitiesLayerRef.current!);
       marker.bindTooltip(
-        `<b>${f.name}</b><br/><span style="font-size:11px;color:${f.flooded ? '#f59e0b' : '#38bdf8'}">${f.type.toUpperCase()}${f.capacity ? ` • Cap: ${f.capacity}` : ''}${f.flooded ? ' (FLOOD ALERT)' : ''}</span><br/><span style="font-size:10px;color:#94a3b8;">${f.address || 'Click for full OSM contact & tags'}</span>`,
+        `<b>${escapeHtml(f.name)}</b><br/><span style="font-size:11px;color:${f.flooded ? '#f59e0b' : '#38bdf8'}">${escapeHtml(f.type.toUpperCase())}${f.capacity ? ` • Cap: ${f.capacity}` : ''}${f.flooded ? ` (${hz.affectedWord} ALERT)` : ''}</span><br/><span style="font-size:10px;color:#94a3b8;">${escapeHtml(f.address || 'Click for full OSM contact & tags')}</span>`,
         { direction: 'top', className: 'custom-map-tooltip' }
       );
       marker.on('click', () => {
@@ -900,7 +1092,7 @@ export default function MapView({
         setSelectedBuilding(null);
       });
     });
-  }, [result, currentFrame, mapZoom]);
+  }, [result, currentFrame, mapZoom, mapViewport, buildingDensity, isPlaying]);
 
   // Render Evacuation Routes
   useEffect(() => {
@@ -914,11 +1106,12 @@ export default function MapView({
       const latlngs: [number, number][] = route.path_coordinates ? route.path_coordinates.map((c) => [c[1], c[0]]) : [];
       if (latlngs.length < 2) return;
 
-      // Route glow effect
+      // Route glow effect (decorative underlay — non-interactive so clicks reach the route line)
       L.polyline(latlngs, {
         color: '#10b981',
         weight: 8,
         opacity: 0.35,
+        interactive: false,
       }).addTo(routesLayerRef.current!);
 
       // Primary safe path with flowing animation
@@ -927,7 +1120,10 @@ export default function MapView({
         weight: 4,
         opacity: 0.95,
         className: 'evac-route-dash',
-      }).addTo(routesLayerRef.current!);
+      }).addTo(routesLayerRef.current!).bindTooltip(
+        `<strong>Evacuation route: ${escapeHtml(route.from_label)} &rarr; ${escapeHtml(route.to_facility_name)}</strong><br/><span style="font-size:10px;color:#94a3b8;">${route.route_distance_km.toFixed(1)} km • ~${Math.round(route.estimated_travel_time_min)} min • ${escapeHtml(route.status)}</span>`,
+        { sticky: true, className: 'custom-map-tooltip' }
+      );
     });
   }, [showEvacuationRoutes, result]);
 
@@ -967,9 +1163,26 @@ export default function MapView({
       {/* Floating Instructions Banner while drawing */}
       {isDrawing && (
         <div className="drawing-guide-banner">
-          <span className="drawing-guide-pulse">✏️</span>
+          <span className="drawing-guide-pulse"><IconPencil size={14} /></span>
           <span>Click and drag a box across the map to simulate <strong>any Area of Interest (AOI)</strong></span>
           <button className="drawing-guide-cancel" onClick={toggleDrawMode}>Cancel</button>
+        </div>
+      )}
+
+      {/* Local non-blocking notice (replaces blocking alert) */}
+      {notice && (
+        <div className="map-notice-banner" role="alert">
+          <span>{notice}</span>
+          <button className="map-notice-dismiss" onClick={() => setNotice(null)} aria-label="Dismiss notice">
+            ✕
+          </button>
+        </div>
+      )}
+
+      {/* Zoom hint: buildings render only at street-level zoom in Medium mode */}
+      {result && (buildingDensity || 'medium') !== 'maximum' && (result.geodata?.buildings?.length || 0) > 0 && mapZoom < BUILDINGS_MIN_ZOOM && (
+        <div className="map-zoom-hint" title="Zoom in to reveal individual buildings">
+          <IconBuilding size={13} className="svg-icon-inline" /> {result.geodata.buildings!.length.toLocaleString()} buildings hidden — zoom in to reveal
         </div>
       )}
 
@@ -978,11 +1191,11 @@ export default function MapView({
         {/* Hazard Selector Pills */}
         <div className="map-hazard-pills-row">
           {[
-            { type: 'flood', icon: '💧', label: 'Flood' },
-            { type: 'cyclone', icon: '🔄', label: 'Cyclone' },
-            { type: 'wildfire', icon: '🔥', label: 'Heatwave' },
-            { type: 'earthquake', icon: '⚡', label: 'Earthquake' },
-            { type: 'landslide', icon: '⛰️', label: 'Landslide' },
+            { type: 'flood', icon: <IconFlood size={14} />, label: 'Flood' },
+            { type: 'cyclone', icon: <IconCyclone size={14} />, label: 'Cyclone' },
+            { type: 'wildfire', icon: <IconHeatwave size={14} />, label: 'Wildfire' },
+            { type: 'earthquake', icon: <IconEarthquake size={14} />, label: 'Earthquake' },
+            { type: 'landslide', icon: <IconLandslide size={14} />, label: 'Landslide' },
           ].map((h) => (
             <button
               key={h.type}
@@ -1032,6 +1245,7 @@ export default function MapView({
               }
             }}
             title="Toggle Fullscreen"
+            aria-label="Toggle fullscreen"
           >
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
               <path d="M8 3H5a2 2 0 0 0-2 2v3" />
@@ -1045,17 +1259,17 @@ export default function MapView({
 
       {/* Floating Right Map Navigation Controls (Matching Image 3) */}
       <div className="map-nav-controls">
-        <button className="map-nav-btn map-nav-btn--compass" onClick={handleResetNorth} title="Reset Orientation (North)">
+        <button className="map-nav-btn map-nav-btn--compass" onClick={handleResetNorth} title="Reset Orientation (North)" aria-label="Reset orientation north">
           <div className="map-compass-dial">
             <span className="compass-n-top">N</span>
             <span className="compass-red-dot"></span>
             <span className="compass-n-bottom">N</span>
           </div>
         </button>
-        <button className="map-nav-btn" onClick={handleZoomIn} title="Zoom In">
+        <button className="map-nav-btn" onClick={handleZoomIn} title="Zoom In" aria-label="Zoom in">
           +
         </button>
-        <button className="map-nav-btn" onClick={handleZoomOut} title="Zoom Out">
+        <button className="map-nav-btn" onClick={handleZoomOut} title="Zoom Out" aria-label="Zoom out">
           −
         </button>
         <button
@@ -1072,6 +1286,7 @@ export default function MapView({
             }
           }}
           title="Center on Area of Interest"
+          aria-label="Center on area of interest"
         >
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
             <circle cx="12" cy="12" r="10" />
@@ -1084,14 +1299,15 @@ export default function MapView({
         </button>
         <button
           className={`map-nav-btn ${is3DMode ? 'map-nav-btn--active' : ''}`}
-          onClick={() => {
-            if (!result) {
-              alert('Please run a simulation or select a scenario first to initialize the Copernicus GLO-30 DEM terrain surface.');
-              return;
-            }
-            setIs3DMode(true);
-          }}
+            onClick={() => {
+              if (!result) {
+                setNotice('Please run a simulation or select a scenario first to initialize the Copernicus GLO-30 DEM terrain surface.');
+                return;
+              }
+              setIs3DMode(true);
+            }}
           title="Launch 3D Terrain Mode"
+          aria-label="Launch 3D terrain mode"
         >
           3D
         </button>
@@ -1134,7 +1350,7 @@ export default function MapView({
             <div className="osm-streetview-slide-header">
               <div className="osm-streetview-slide-title-wrap">
                 <div className="osm-streetview-slide-title">
-                  <span>🛣️</span>
+                  <span><IconRoad size={14} className="svg-icon-inline" /></span>
                   <span>Panoramic Street View</span>
                 </div>
                 <div className="osm-streetview-slide-coords">
@@ -1145,7 +1361,7 @@ export default function MapView({
                 <a
                   href={`https://www.google.com/maps/@?api=1&map_action=pano&viewpoint=${coords.lat},${coords.lon}`}
                   target="_blank"
-                  rel="noreferrer"
+                  rel="noopener noreferrer"
                   className="osm-streetview-external-link"
                   title="Open full interactive 360° view in Google Maps"
                 >
@@ -1155,6 +1371,7 @@ export default function MapView({
                   className="osm-streetview-close-btn"
                   onClick={() => setShowStreetViewPanel(false)}
                   title="Collapse Street View Panel"
+                  aria-label="Collapse street view panel"
                 >
                   ✕
                 </button>
@@ -1186,19 +1403,19 @@ export default function MapView({
         <div className="osm-inspector-modal">
           <div className="osm-inspector-modal__header">
             <div>
-              <div className="osm-inspector-modal__title">🛣️ {selectedRoad.name}</div>
+              <div className="osm-inspector-modal__title"><IconRoad size={15} className="svg-icon-inline" /> {selectedRoad.name}</div>
               <div className="osm-inspector-modal__subtitle">
                 OSM Way #{selectedRoad.id} • {selectedRoad.type.toUpperCase()}
               </div>
               <span className={`road-status-badge road-status-badge--${selectedRoad.status}`}>
                 {selectedRoad.status === 'closed'
-                  ? `CLOSED (${(selectedRoad.flood_depth || 2.1).toFixed(1)}m)`
+                  ? (selectedRoad.closure_reason || 'CLOSED')
                   : selectedRoad.status === 'restricted'
-                  ? 'RESTRICTED ACCESS'
+                  ? (selectedRoad.closure_reason || 'RESTRICTED ACCESS')
                   : 'OPERATIONAL & SAFE'}
               </span>
             </div>
-            <button className="osm-inspector-modal__close" onClick={() => setSelectedRoad(null)}>
+            <button className="osm-inspector-modal__close" onClick={() => setSelectedRoad(null)} aria-label="Close road details">
               ✕
             </button>
           </div>
@@ -1230,7 +1447,7 @@ export default function MapView({
                 <span className="osm-stat-chip-val">{selectedRoad.oneway === 'yes' ? 'Yes' : 'Two-way'}</span>
               </div>
               <div className="osm-stat-chip">
-                <span className="osm-stat-chip-label">🏔️ Elevation</span>
+                <span className="osm-stat-chip-label">Elevation</span>
                 <span className="osm-stat-chip-val" style={{ color: '#38bdf8' }}>
                   {selectedRoad.elevation_m !== undefined ? `${selectedRoad.elevation_m.toFixed(1)} m ASL` : 'DEM Calibrated'}
                 </span>
@@ -1249,12 +1466,12 @@ export default function MapView({
               </div>
             </div>
 
-            <div className="osm-inspector-modal__row">
-              <span className="osm-inspector-modal__label">Hazard Impact</span>
-              <span className="osm-inspector-modal__val" style={{ color: selectedRoad.status === 'closed' ? '#f87171' : selectedRoad.status === 'restricted' ? '#fbbf24' : '#34d399' }}>
-                {selectedRoad.status === 'closed' ? `Submerged (${selectedRoad.flood_depth}m)` : selectedRoad.status === 'restricted' ? `Caution (${selectedRoad.flood_depth}m)` : 'Passable'}
-              </span>
-            </div>
+              <div className="osm-inspector-modal__row">
+                <span className="osm-inspector-modal__label">Hazard Impact</span>
+                <span className="osm-inspector-modal__val" style={{ color: selectedRoad.status === 'closed' ? '#f87171' : selectedRoad.status === 'restricted' ? '#fbbf24' : '#34d399' }}>
+                  {`${selectedRoad.closure_reason || 'No hazard exposure'}${selectedRoad.hazard_severity !== undefined ? ` • ${selectedRoad.hazard_severity} ${result?.impact?.hazard_unit || ''}` : ''}`}
+                </span>
+              </div>
 
             <div className="osm-inspector-modal__row">
               <span className="osm-inspector-modal__label">Infrastructure</span>
@@ -1274,9 +1491,9 @@ export default function MapView({
               className="osm-link-btn"
               href={`https://www.openstreetmap.org/way/${selectedRoad.id}`}
               target="_blank"
-              rel="noreferrer"
+              rel="noopener noreferrer"
             >
-              🌐 Open in OpenStreetMap ↗
+              Open in OpenStreetMap ↗
             </a>
 
             <RawTagsViewer tags={selectedRoad.raw_tags} />
@@ -1290,16 +1507,16 @@ export default function MapView({
           <div className="osm-inspector-modal__header">
             <div>
               <div className="osm-inspector-modal__title">
-                {selectedFacility.type === 'hospital' ? '🏥' : '🏠'} {selectedFacility.name}
+                {selectedFacility.type === 'hospital' ? <IconHospital size={15} className="svg-icon-inline" /> : selectedFacility.type === 'shelter' || selectedFacility.type === 'school' ? <IconShelter size={15} className="svg-icon-inline" /> : selectedFacility.type === 'police' || selectedFacility.type === 'fire_station' ? <IconPolice size={15} className="svg-icon-inline" /> : <IconLocationPin size={15} className="svg-icon-inline" />}{' '}{selectedFacility.name}
               </div>
               <div className="osm-inspector-modal__subtitle">
                 OSM Facility #{selectedFacility.id} • {selectedFacility.type.toUpperCase()}
               </div>
               <span className={`road-status-badge ${selectedFacility.flooded ? 'road-status-badge--closed' : 'road-status-badge--open'}`}>
-                {selectedFacility.flooded ? `FLOODED (${selectedFacility.flood_depth}m)` : 'OPERATIONAL & SAFE'}
+                {selectedFacility.flooded ? `${hz.affectedWord} (${(selectedFacility.hazard_severity ?? selectedFacility.flood_depth).toFixed(2)} ${hz.unit})${selectedFacility.functionality && selectedFacility.functionality !== 'operational' ? ` • ${selectedFacility.functionality.toUpperCase()}` : ''}${selectedFacility.smoke_risk ? ' • SMOKE RISK' : ''}` : 'OPERATIONAL & SAFE'}
               </span>
             </div>
-            <button className="osm-inspector-modal__close" onClick={() => setSelectedFacility(null)}>
+            <button className="osm-inspector-modal__close" onClick={() => setSelectedFacility(null)} aria-label="Close facility details">
               ✕
             </button>
           </div>
@@ -1323,7 +1540,7 @@ export default function MapView({
                 <span className="osm-stat-chip-val">{selectedFacility.district || 'Mumbai'}</span>
               </div>
               <div className="osm-stat-chip">
-                <span className="osm-stat-chip-label">🏔️ Elevation</span>
+                <span className="osm-stat-chip-label">Elevation</span>
                 <span className="osm-stat-chip-val" style={{ color: '#38bdf8' }}>
                   {selectedFacility.elevation_m !== undefined ? `${selectedFacility.elevation_m.toFixed(1)} m ASL` : 'DEM Calibrated'}
                 </span>
@@ -1354,9 +1571,13 @@ export default function MapView({
             {selectedFacility.website && (
               <div className="osm-inspector-modal__row">
                 <span className="osm-inspector-modal__label">Website</span>
-                <a href={selectedFacility.website} target="_blank" rel="noreferrer" style={{ color: '#38bdf8', fontSize: '11px', textDecoration: 'underline' }}>
-                  Official Portal ↗
-                </a>
+                {isSafeHttpUrl(selectedFacility.website) ? (
+                  <a href={selectedFacility.website} target="_blank" rel="noopener noreferrer" style={{ color: '#38bdf8', fontSize: '11px', textDecoration: 'underline' }}>
+                    Official Portal ↗
+                  </a>
+                ) : (
+                  <span className="osm-inspector-modal__val" title={selectedFacility.website}>{selectedFacility.website}</span>
+                )}
               </div>
             )}
 
@@ -1364,9 +1585,9 @@ export default function MapView({
               className="osm-link-btn"
               href={`https://www.openstreetmap.org/node/${selectedFacility.id}`}
               target="_blank"
-              rel="noreferrer"
+              rel="noopener noreferrer"
             >
-              🌐 Open in OpenStreetMap ↗
+              Open in OpenStreetMap ↗
             </a>
 
             <RawTagsViewer tags={selectedFacility.raw_tags} />
@@ -1379,15 +1600,15 @@ export default function MapView({
         <div className="osm-inspector-modal">
           <div className="osm-inspector-modal__header">
             <div>
-              <div className="osm-inspector-modal__title">🏢 {selectedBuilding.name}</div>
+              <div className="osm-inspector-modal__title"><IconBuilding size={15} className="svg-icon-inline" /> {selectedBuilding.name}</div>
               <div className="osm-inspector-modal__subtitle">
                 OSM Structure #{selectedBuilding.id} • {selectedBuilding.type.toUpperCase()}
               </div>
               <span className={`road-status-badge ${selectedBuilding.flooded ? 'road-status-badge--closed' : 'road-status-badge--open'}`}>
-                {selectedBuilding.flooded ? `FLOODED (${selectedBuilding.flood_depth.toFixed(2)}m)` : 'INTACT & DRY'}
+                {selectedBuilding.flooded ? `${selectedBuilding.damage_state && !['None', 'Unaffected'].includes(selectedBuilding.damage_state) ? selectedBuilding.damage_state.toUpperCase() : hz.affectedWord} (${(selectedBuilding.hazard_severity ?? selectedBuilding.flood_depth).toFixed(2)} ${hz.unit})` : hz.clearWord}
               </span>
             </div>
-            <button className="osm-inspector-modal__close" onClick={() => setSelectedBuilding(null)}>
+            <button className="osm-inspector-modal__close" onClick={() => setSelectedBuilding(null)} aria-label="Close building details">
               ✕
             </button>
           </div>
@@ -1409,11 +1630,11 @@ export default function MapView({
               <div className="osm-stat-chip">
                 <span className="osm-stat-chip-label">Damage Est.</span>
                 <span className="osm-stat-chip-val" style={{ color: selectedBuilding.flooded ? '#f87171' : '#34d399' }}>
-                  {selectedBuilding.flooded ? `₹${Math.round(selectedBuilding.area_sqm * 12000).toLocaleString('en-IN')}` : '₹0 (Safe)'}
+                  {selectedBuilding.flooded ? `₹${Math.round(selectedBuilding.area_sqm * 12000 * (selectedBuilding.damage_ratio ?? 1)).toLocaleString('en-IN')}` : '₹0 (Safe)'}
                 </span>
               </div>
               <div className="osm-stat-chip">
-                <span className="osm-stat-chip-label">🏔️ Elevation</span>
+                <span className="osm-stat-chip-label">Elevation</span>
                 <span className="osm-stat-chip-val" style={{ color: '#38bdf8' }}>
                   {selectedBuilding.elevation_m !== undefined ? `${selectedBuilding.elevation_m.toFixed(1)} m ASL` : 'DEM Calibrated'}
                 </span>
@@ -1436,9 +1657,9 @@ export default function MapView({
               className="osm-link-btn"
               href={`https://www.openstreetmap.org/way/${selectedBuilding.id}`}
               target="_blank"
-              rel="noreferrer"
+              rel="noopener noreferrer"
             >
-              🌐 Open in OpenStreetMap ↗
+              Open in OpenStreetMap ↗
             </a>
 
             <RawTagsViewer tags={selectedBuilding.raw_tags} />
@@ -1450,28 +1671,15 @@ export default function MapView({
 
 
 
-      {/* Real-time OSM Data HUD Badge */}
-      {result?.geodata && (
-        <div className="osm-data-fidelity-hud">
-          <span style={{ color: '#38bdf8' }}>🌐 OSM Live Stream</span>
-          <span>•</span>
-          <span>{result.geodata.roads?.length || 0} Roads</span>
-          <span>•</span>
-          <span>{result.geodata.facilities?.length || result.impact?.facilities?.length || 0} Facilities</span>
-          <span>•</span>
-          <span>{result.geodata.buildings?.length || 0} Buildings</span>
-          <span>•</span>
-          <span style={{ color: '#34d399', fontWeight: 700 }}>✓ 100% Data Preserved</span>
-        </div>
-      )}
-
       {/* 3D Terrain Viewer Modal (Copernicus GLO-30 DEM Calibrated) */}
       {is3DMode && result && (
-        <Terrain3DViewer
-          result={result}
-          currentFrame={currentFrame}
-          onClose={() => setIs3DMode(false)}
-        />
+        <Suspense fallback={<div className="terrain3d-loading-fallback">Loading 3D terrain…</div>}>
+          <Terrain3DViewer
+            result={result}
+            currentFrame={currentFrame}
+            onClose={() => setIs3DMode(false)}
+          />
+        </Suspense>
       )}
 
 

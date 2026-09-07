@@ -8,8 +8,11 @@ and elliptical Huygens perimeter expansion.
 
 import numpy as np
 import math
+import logging
 from typing import Dict, Any, List, Tuple, Optional
 from simulation.base import BaseHazardModule, HazardOutput
+
+logger = logging.getLogger(__name__)
 
 
 class WildfireHazardModule(BaseHazardModule):
@@ -64,7 +67,7 @@ class WildfireHazardModule(BaseHazardModule):
 
         rows, cols = elevation.shape
         if bbox is None:
-            bbox = {"south": 18.98, "west": 72.81, "north": 19.03, "east": 72.86}
+            raise ValueError("bbox is required")
 
         # Calculate fuel moisture from RH and Temperature
         # Equilibrium moisture content (EMC):

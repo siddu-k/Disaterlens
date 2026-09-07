@@ -9,8 +9,11 @@ topographic Vs30 site amplification, and HAZUS building damage states.
 
 import numpy as np
 import math
+import logging
 from typing import Dict, Any, List, Tuple, Optional
 from simulation.base import BaseHazardModule, HazardOutput
+
+logger = logging.getLogger(__name__)
 
 
 class EarthquakeHazardModule(BaseHazardModule):
@@ -60,7 +63,7 @@ class EarthquakeHazardModule(BaseHazardModule):
         
         rows, cols = elevation.shape
         if bbox is None:
-            bbox = {"south": 18.98, "west": 72.81, "north": 19.03, "east": 72.86}
+            raise ValueError("bbox is required")
 
         center_lat = (bbox["north"] + bbox["south"]) / 2.0
         center_lon = (bbox["east"] + bbox["west"]) / 2.0

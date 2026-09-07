@@ -2,55 +2,98 @@
 
 import { SimulationRequest, SimulationResult, ProvenanceResponse, ScenarioPreset } from '../types';
 
-const API_BASE = 'http://localhost:8000/api';
+const API_BASE = import.meta.env.VITE_API_BASE ?? '/api';
+
+const DEFAULT_TIMEOUT_MS = 30000;
+const SIMULATION_TIMEOUT_MS = 90000;
+
+async function fetchJson<T>(url: string, init?: RequestInit, timeoutMs: number = DEFAULT_TIMEOUT_MS): Promise<T> {
+  let lastError: unknown = null;
+  // ONE retry on network-level failure only (TypeError/abort) — never retry 4xx/5xx.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(url, { ...init, signal: controller.signal });
+      window.clearTimeout(timer);
+      if (!response.ok) {
+        let detail: string | undefined;
+        try {
+          const body = await response.json();
+          detail = (body as { detail?: string; message?: string })?.detail
+            ?? (body as { detail?: string; message?: string })?.message;
+        } catch {
+          detail = response.statusText;
+        }
+        throw new Error(detail || `HTTP ${response.status}`);
+      }
+      return (await response.json()) as T;
+    } catch (err) {
+      window.clearTimeout(timer);
+      const isNetworkFailure = err instanceof TypeError || (err as Error)?.name === 'AbortError';
+      lastError = err;
+      if (!isNetworkFailure) throw err;
+      // fall through to retry once
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+// Minimal runtime guard: protects `result.simulation.frames.length` from malformed payloads.
+export function assertSimulationResult(data: unknown): asserts data is SimulationResult {
+  if (!data || typeof data !== 'object' || !Array.isArray((data as { simulation?: { frames?: unknown } }).simulation?.frames)) {
+    throw new Error('Invalid simulation response: expected simulation.frames to be an array.');
+  }
+}
 
 export async function runSimulation(request: SimulationRequest): Promise<SimulationResult> {
-  const response = await fetch(`${API_BASE}/simulate`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(request),
-  });
+  const data = await fetchJson<SimulationResult>(
+    `${API_BASE}/simulate`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request),
+    },
+    SIMULATION_TIMEOUT_MS
+  );
 
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({ detail: 'Simulation request failed' }));
-    throw new Error(error.detail || `HTTP ${response.status}`);
-  }
-
-  return response.json();
+  assertSimulationResult(data);
+  return data;
 }
 
 export async function healthCheck(): Promise<{ status: string; gemini_configured: boolean; supported_disasters: string[] }> {
-  const response = await fetch(`${API_BASE}/health`);
-  return response.json();
+  return fetchJson(`${API_BASE}/health`);
 }
 
 export async function getPresets(): Promise<ScenarioPreset[]> {
-  const response = await fetch(`${API_BASE}/scenarios/presets`);
-  const data = await response.json();
+  const data = await fetchJson<{ presets?: ScenarioPreset[] }>(`${API_BASE}/scenarios/presets`);
   return data.presets || [];
 }
 
 export async function getProvenance(disasterType: string = 'flood'): Promise<ProvenanceResponse> {
-  const response = await fetch(`${API_BASE}/provenance?disaster_type=${disasterType}`);
-  return response.json();
+  return fetchJson(`${API_BASE}/provenance?disaster_type=${disasterType}`);
 }
 
 export async function parseNaturalLanguageScenario(prompt: string, currentDisaster: string): Promise<any> {
-  const response = await fetch(`${API_BASE}/scenario/parse`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ prompt, current_disaster: currentDisaster }),
-  });
-  return response.json();
+  return fetchJson(
+    `${API_BASE}/scenario/parse`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt, current_disaster: currentDisaster }),
+    }
+  );
 }
 
 export async function compareSimulations(runIdA: string, runIdB: string): Promise<any> {
-  const response = await fetch(`${API_BASE}/compare`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ run_id_a: runIdA, run_id_b: runIdB }),
-  });
-  return response.json();
+  return fetchJson(
+    `${API_BASE}/compare`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ run_id_a: runIdA, run_id_b: runIdB }),
+    }
+  );
 }
 
 export async function geocodeLocation(query: string): Promise<{ name: string; bbox: { south: number; west: number; north: number; east: number }; lat: number; lon: number } | null> {

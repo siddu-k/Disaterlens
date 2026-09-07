@@ -11,12 +11,47 @@ Provides two distinct AI capabilities:
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
 import json
+import logging
 import config
+
+logger = logging.getLogger(__name__)
 
 try:
     from google import genai
 except ImportError:
     genai = None
+
+ALLOWED_DISASTER_TYPES = {"flood", "cyclone", "earthquake", "wildfire", "landslide"}
+
+_client = None
+
+
+def _get_client():
+    """Module-level singleton genai.Client (created once, reused; HTTP timeout applied)."""
+    global _client
+    if _client is None and genai is not None and config.GEMINI_API_KEY:
+        _client = genai.Client(
+            api_key=config.GEMINI_API_KEY,
+            http_options={"timeout": config.GEMINI_TIMEOUT_MS},
+        )
+    return _client
+
+
+def _truncate(text: str, max_chars: int = config.MAX_SCENARIO_CHARS) -> str:
+    """Cap context size before interpolating into prompts."""
+    if text is None:
+        return ""
+    text = str(text)
+    if len(text) > max_chars:
+        return text[:max_chars] + "... [truncated]"
+    return text
+
+
+def _validate_disaster_type(value: Any) -> str:
+    """Map unknown/empty disaster types to 'flood'."""
+    if isinstance(value, str) and value.strip().lower() in ALLOWED_DISASTER_TYPES:
+        return value.strip().lower()
+    return "flood"
 
 
 class ParsedScenario(BaseModel):
@@ -52,7 +87,9 @@ def parse_natural_language_scenario(prompt: str, current_disaster: str = "flood"
         return _fallback_parse_scenario(prompt, current_disaster)
 
     try:
-        client = genai.Client(api_key=config.GEMINI_API_KEY)
+        client = _get_client()
+        if client is None:
+            return _fallback_parse_scenario(prompt, current_disaster)
         system_instructions = (
             "You are a strict disaster scenario parameter extractor. Extract ONLY numerical scenario parameters "
             "into JSON for the disaster simulation engines. Valid disasters: flood (rainfall_mm, duration_hours, sea_level_surge_m), "
@@ -63,7 +100,7 @@ def parse_natural_language_scenario(prompt: str, current_disaster: str = "flood"
 
         response = client.models.generate_content(
             model="gemini-2.0-flash",
-            contents=f"{system_instructions}\nUser Request: {prompt}\nDefault Disaster: {current_disaster}",
+            contents=f"{system_instructions}\nUser Request: {_truncate(prompt)}\nDefault Disaster: {current_disaster}",
             config={
                 "response_mime_type": "application/json",
                 "response_schema": ParsedScenario,
@@ -72,14 +109,14 @@ def parse_natural_language_scenario(prompt: str, current_disaster: str = "flood"
         if response.parsed:
             p = response.parsed
             return {
-                "disaster_type": p.disaster_type,
+                "disaster_type": _validate_disaster_type(p.disaster_type),
                 "parameters": p.parameters,
                 "confidence": p.confidence,
                 "clarification": p.clarification_needed,
                 "source": "gemini",
             }
     except Exception as e:
-        print(f"[AI Parser] Warning: {e}")
+        logger.warning(f"[AI Parser] Warning: {e}")
 
     return _fallback_parse_scenario(prompt, current_disaster)
 
@@ -96,7 +133,9 @@ def generate_insight(
         return _fallback_insight(scenario, impact, location_name)
 
     try:
-        client = genai.Client(api_key=config.GEMINI_API_KEY)
+        client = _get_client()
+        if client is None:
+            return _fallback_insight(scenario, impact, location_name)
         context = _build_strict_context(scenario, impact, location_name)
 
         response = client.models.generate_content(
@@ -121,7 +160,7 @@ def generate_insight(
                 "source": "Google Gemini 2.0 Flash (Grounded)",
             }
     except Exception as e:
-        print(f"[AI Analyst] Warning: {e}")
+        logger.warning(f"[AI Analyst] Warning: {e}")
 
     return _fallback_insight(scenario, impact, location_name)
 
@@ -139,7 +178,7 @@ Explicitly distinguish:
 
 Location: {location_name}
 Disaster Type: {impact.get('disaster_type', 'flood')}
-Scenario Parameters: {json.dumps(scenario)}
+Scenario Parameters: {_truncate(json.dumps(scenario))}
 
 Computed Impact Facts:
 - Affected Area: {impact.get('flooded_area_km2', 0)} km² (Modeled)
@@ -195,7 +234,7 @@ def _fallback_parse_scenario(prompt: str, current_disaster: str) -> Dict[str, An
         params["max_wind_kmh"] = float(wind_m.group(1))
 
     return {
-        "disaster_type": dtype,
+        "disaster_type": _validate_disaster_type(dtype),
         "parameters": params,
         "confidence": 0.85,
         "clarification": None,

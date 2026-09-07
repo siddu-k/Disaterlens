@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useEffect } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import './index.css';
 import {
   SimulationResult,
@@ -19,43 +19,73 @@ import {
   reverseGeocodeLocation,
 } from './services/api';
 import MapView from './components/MapView';
+import ErrorBoundary from './components/ErrorBoundary';
 import {
-  IconFlood,
-  IconCyclone,
-  IconHeatwave,
-  IconEarthquake,
-  IconLandslide,
   IconLocationPin,
   IconSearch,
-  IconPopulation,
-  IconBuilding,
-  IconRoad,
-  IconAlertTriangle,
   IconPolice,
   IconHospital,
   IconShelter,
   IconFireStation,
   IconSchool,
   IconMedicalCross,
-  IconInsight,
   IconPlay,
   IconPause,
+  IconFlood,
+  IconCyclone,
+  IconHeatwave,
+  IconEarthquake,
+  IconLandslide,
+  IconPopulation,
+  IconBuilding,
+  IconRoad,
+  IconAlertTriangle,
+  IconInsight,
 } from './components/Icons';
 
-const DEFAULT_MUMBAI_BBOX: BoundingBox = {
-  south: 18.9800,
-  west: 72.8150,
-  north: 19.0350,
-  east: 72.8650,
-};
+// ─── Run History persistence (localStorage, quota-safe) ─────────────
+interface RunHistoryEntry {
+  id: string;
+  summary: string;
+  disaster: string;
+  time: string;
+  result: SimulationResult;
+}
 
-const DISASTER_PILLS: { type: DisasterType; icon: React.ReactNode; label: string }[] = [
-  { type: 'flood', icon: <IconFlood size={14} />, label: 'Flood' },
-  { type: 'cyclone', icon: <IconCyclone size={14} />, label: 'Cyclone' },
-  { type: 'wildfire', icon: <IconHeatwave size={14} />, label: 'Heatwave' },
-  { type: 'earthquake', icon: <IconEarthquake size={14} />, label: 'Earthquake' },
-  { type: 'landslide', icon: <IconLandslide size={14} />, label: 'Landslide' },
-];
+const HISTORY_STORAGE_KEY = 'disasterlens-run-history';
+const HISTORY_MAX_ENTRIES = 10;
+
+function loadRunHistory(): RunHistoryEntry[] {
+  try {
+    const raw = localStorage.getItem(HISTORY_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return (parsed as RunHistoryEntry[]).filter(
+      (e) =>
+        e &&
+        typeof e.id === 'string' &&
+        typeof e.summary === 'string' &&
+        typeof e.disaster === 'string' &&
+        typeof e.time === 'string' &&
+        Array.isArray((e.result as unknown as { simulation?: { frames?: unknown } })?.simulation?.frames)
+    ).slice(0, HISTORY_MAX_ENTRIES);
+  } catch {
+    return [];
+  }
+}
+
+function saveRunHistory(entries: RunHistoryEntry[]): void {
+  // localStorage quota (~5MB) may not fit all runs — keep the newest entries that fit.
+  for (const n of [entries.length, 5, 3, 1]) {
+    try {
+      localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(entries.slice(0, Math.max(n, 0))));
+      return;
+    } catch {
+      /* quota exceeded — retry with fewer entries */
+    }
+  }
+}
 
 function App() {
   // State (Initialized clean: no auto-selected city or auto-scan on start)
@@ -80,12 +110,7 @@ function App() {
   const [loadingStep, setLoadingStep] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [backendStatus, setBackendStatus] = useState<'online' | 'offline' | 'checking'>('checking');
-  const [lastCompletedRun, setLastCompletedRun] = useState<{
-    id: string;
-    summary: string;
-    disaster: string;
-    time: string;
-  } | null>(null);
+  const [runHistory, setRunHistory] = useState<RunHistoryEntry[]>(loadRunHistory);
 
   // Timeline State
   const [currentFrame, setCurrentFrame] = useState(0);
@@ -96,6 +121,17 @@ function App() {
   // Map & Visual State
   const [mapMode, setMapMode] = useState<'satellite' | 'map'>('satellite');
   const [selectedRoad, setSelectedRoad] = useState<RoadFeature | null>(null);
+  const [focusedFacility, setFocusedFacility] = useState<{ fac: any; nonce: number } | null>(null);
+  const [showAllFacilities, setShowAllFacilities] = useState(false);
+  const [warningsDismissedForRun, setWarningsDismissedForRun] = useState<string | null>(null);
+  const [settingsPageOpen, setSettingsPageOpen] = useState(false);
+  const [buildingDensity, setBuildingDensity] = useState<'medium' | 'maximum'>(() => {
+    try {
+      return localStorage.getItem('disasterlens-building-density') === 'maximum' ? 'maximum' : 'medium';
+    } catch {
+      return 'medium';
+    }
+  });
   const [showEvacuationRoutes, setShowEvacuationRoutes] = useState(false);
 
   // Drawers & Modals
@@ -122,6 +158,18 @@ function App() {
   useEffect(() => {
     getProvenance(disasterType).then((prov) => setProvenanceData(prov)).catch(() => {});
   }, [disasterType]);
+
+  // Persist run history across refreshes
+  useEffect(() => {
+    saveRunHistory(runHistory);
+  }, [runHistory]);
+
+  // Persist building density preference
+  useEffect(() => {
+    try {
+      localStorage.setItem('disasterlens-building-density', buildingDensity);
+    } catch {}
+  }, [buildingDensity]);
 
   // Timeline playback loop
   useEffect(() => {
@@ -189,20 +237,24 @@ function App() {
       setCurrentFrame(0);
       setIsPlaying(false);
 
-      setLastCompletedRun({
-        id: simResult.run_uuid ? simResult.run_uuid.slice(0, 8) : 'sim',
-        summary: targetDisaster === 'flood'
-          ? `${overrides?.rainfall_mm ?? rainfallMm}mm Rain, +${overrides?.sea_level_surge_m ?? seaLevelSurge}m Surge (${overrides?.duration_hours ?? durationHours}h)`
-          : targetDisaster === 'earthquake'
-          ? `Mw ${overrides?.magnitude ?? magnitude} (${overrides?.depth_km ?? depthKm}km Depth)`
-          : targetDisaster === 'cyclone'
-          ? `${overrides?.wind_speed_kmh ?? windSpeedKmh} km/h Wind (${overrides?.central_pressure_hpa ?? centralPressure} hPa)`
-          : targetDisaster === 'wildfire'
-          ? `${overrides?.temperature_c ?? tempC}°C, ${overrides?.wind_speed_kmh ?? windSpeedKmh}km/h`
-          : `${overrides?.rainfall_mm ?? rainfallMm}mm Rain`,
-        disaster: targetDisaster,
-        time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-      });
+      setRunHistory((prev) => [
+        {
+          id: simResult.run_uuid ? simResult.run_uuid.slice(0, 8) : `run-${Date.now()}`,
+          summary: targetDisaster === 'flood'
+            ? `${overrides?.rainfall_mm ?? rainfallMm}mm Rain, +${overrides?.sea_level_surge_m ?? seaLevelSurge}m Surge (${overrides?.duration_hours ?? durationHours}h)`
+            : targetDisaster === 'earthquake'
+            ? `Mw ${overrides?.magnitude ?? magnitude} (${overrides?.depth_km ?? depthKm}km Depth)`
+            : targetDisaster === 'cyclone'
+            ? `${overrides?.wind_speed_kmh ?? windSpeedKmh} km/h Wind (${overrides?.central_pressure_hpa ?? centralPressure} hPa)`
+            : targetDisaster === 'wildfire'
+            ? `${overrides?.temperature_c ?? tempC}°C, ${overrides?.wind_speed_kmh ?? windSpeedKmh}km/h`
+            : `${overrides?.rainfall_mm ?? rainfallMm}mm Rain`,
+          disaster: targetDisaster,
+          time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+          result: simResult,
+        },
+        ...prev,
+      ].slice(0, HISTORY_MAX_ENTRIES));
 
       if (simResult.provenance) {
         setProvenanceData(simResult.provenance);
@@ -217,6 +269,23 @@ function App() {
 
   const handleDisasterSelect = (type: DisasterType) => {
     setDisasterType(type);
+  };
+
+  const disasterIcon = (d: string, size = 14) =>
+    d === 'flood' ? <IconFlood size={size} /> : d === 'cyclone' ? <IconCyclone size={size} /> : d === 'earthquake' ? <IconEarthquake size={size} /> : d === 'wildfire' ? <IconHeatwave size={size} /> : <IconLandslide size={size} />;
+
+  // Restore a previous run from history (map, timeline, impact + provenance all follow `result`)
+  const handleSelectHistoryRun = (entry: { disaster: string; result: SimulationResult }) => {
+    setResult(entry.result);
+    setDisasterType(entry.disaster as DisasterType);
+    setCurrentFrame(0);
+    setIsPlaying(false);
+    setSelectedRoad(null);
+    setShowEvacuationRoutes(false);
+    setError(null);
+    if (entry.result.provenance) {
+      setProvenanceData(entry.result.provenance);
+    }
   };
 
   const handleApplyPreset = (p: ScenarioPreset) => {
@@ -258,7 +327,7 @@ function App() {
       });
       setNlPrompt('');
     } catch (err: any) {
-      alert('Could not parse scenario: ' + err.message);
+      setError('Could not parse scenario: ' + err.message);
     } finally {
       setNlParsing(false);
     }
@@ -278,10 +347,10 @@ function App() {
         setResult(null);
         setSelectedRoad(null);
       } else {
-        alert(`Location "${locationName}" not found on OpenStreetMap. Try a city, region, or draw an area on the map.`);
+        setError(`Location "${locationName}" not found on OpenStreetMap. Try a city, region, or draw an area on the map.`);
       }
     } catch (err: any) {
-      alert('Geocoding error: ' + err.message);
+      setError('Geocoding error: ' + err.message);
     } finally {
       setLoading(false);
     }
@@ -307,6 +376,7 @@ function App() {
   // Computed values
   const impact = result?.impact;
   const aiInsight = result?.ai_insight;
+  const isSynthetic = result?.geodata?.is_synthetic || result?.is_synthetic;
   const totalFrames = result?.simulation.frames.length || 0;
   const currentTime = result?.simulation.timesteps?.[currentFrame] ?? 0;
   const totalSimulationHours = result?.simulation.total_time_hours || durationHours;
@@ -338,7 +408,7 @@ function App() {
     ? impact.facilities
     : (result?.geodata?.facilities && result.geodata.facilities.length > 0 ? result.geodata.facilities : []);
 
-  const displayFacilities = realFacilities.slice(0, 4);
+  const displayFacilities = showAllFacilities ? realFacilities : realFacilities.slice(0, 4);
 
   const getFacilityVisual = (typeOrName?: string) => {
     const t = (typeOrName || '').toLowerCase();
@@ -362,6 +432,36 @@ function App() {
 
   return (
     <div className="app-root-layout">
+      {/* Dismissible error banner (existing error state, previously never rendered) */}
+      {error && (
+        <div className="app-error-banner" role="alert">
+          <span className="app-error-banner__text">{error}</span>
+          <button
+            className="app-error-banner__close"
+            onClick={() => setError(null)}
+            aria-label="Dismiss error"
+          >
+            ✕
+          </button>
+        </div>
+      )}
+      {/* Fetch warnings: area too large / services rate-limited (per-run dismissible) */}
+      {result?.warnings && result.warnings.length > 0 && warningsDismissedForRun !== result.run_uuid && (
+        <div className="app-warning-banner" role="status">
+          <div className="app-warning-banner__list">
+            {result.warnings.map((w, i) => (
+              <div key={i} className="app-warning-banner__text"><IconAlertTriangle size={13} className="svg-icon-inline" /> {w}</div>
+            ))}
+          </div>
+          <button
+            className="app-warning-banner__close"
+            onClick={() => result && setWarningsDismissedForRun(result.run_uuid)}
+            aria-label="Dismiss warnings"
+          >
+            ✕
+          </button>
+        </div>
+      )}
       {/* ─── Left Sidebar ────────────────────────────────────────── */}
       <aside className="app-left-sidebar">
         <div>
@@ -429,11 +529,11 @@ function App() {
               </span>
               <span>Results</span>
             </button>
-            <button className="sidebar-nav-btn" onClick={() => setShowProvenanceDrawer(true)}>
+            <button className="sidebar-nav-btn" onClick={() => setSettingsPageOpen(true)}>
               <span className="sidebar-nav-icon">
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
                   <circle cx="12" cy="12" r="3" />
-                  <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
+                  <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
                 </svg>
               </span>
               <span>Settings</span>
@@ -441,7 +541,51 @@ function App() {
           </nav>
         </div>
 
-        <div className="sidebar-footer">
+          {/* ─── Run History (every Run Simulation is stored here) ─── */}
+          <div className="sidebar-history-section">
+            <div className="sidebar-history-header">
+              <span className="sidebar-history-title">Run History</span>
+              {runHistory.length > 0 && (
+                <button
+                  className="sidebar-history-clear"
+                  onClick={() => setRunHistory([])}
+                  title="Clear run history"
+                  aria-label="Clear run history"
+                >
+                  Clear
+                </button>
+              )}
+            </div>
+            {runHistory.length === 0 ? (
+              <div className="sidebar-history-empty">
+                No simulations yet.<br />Each run will be stored here.
+              </div>
+            ) : (
+              <div className="sidebar-history-list">
+                {runHistory.map((run, idx) => {
+                  const isActive = result?.run_uuid != null && result.run_uuid === run.result.run_uuid;
+                  return (
+                    <button
+                      key={`${run.id}-${idx}`}
+                      className={`sidebar-history-item${isActive ? ' sidebar-history-item--active' : ''}`}
+                      onClick={() => handleSelectHistoryRun(run)}
+                      title={run.summary}
+                    >
+                      <span className="sidebar-history-emoji">{disasterIcon(run.disaster, 16)}</span>
+                      <span className="sidebar-history-meta">
+                        <span className="sidebar-history-summary">{run.summary}</span>
+                        <span className="sidebar-history-sub">
+                          #{runHistory.length - idx} • {run.disaster} • {run.time}
+                        </span>
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          <div className="sidebar-footer">
           <div className="sidebar-wave-container">
             <svg width="100%" height="48" viewBox="0 0 180 50" fill="none">
               <path d="M0 25 C30 5, 60 45, 90 25 C120 5, 150 45, 180 25" stroke="#38bdf8" strokeWidth="1.6" strokeOpacity="0.4" />
@@ -473,6 +617,10 @@ function App() {
           </form>
 
           <div className="header-meta-group">
+            <span
+              className={`backend-status-dot backend-status-dot--${backendStatus}`}
+              title={backendStatus === 'online' ? 'Backend online' : backendStatus === 'offline' ? 'Backend offline' : 'Checking backend status'}
+            />
             <div className="header-location-badge">
               <span className="header-loc-pin">
                 <IconLocationPin size={15} color="#38bdf8" />
@@ -491,19 +639,24 @@ function App() {
         <main className="app-workspace-body">
           {/* Map Container */}
           <div className="workspace-map-container">
-            <MapView
-              mapMode={mapMode}
-              setMapMode={setMapMode}
-              onBboxSelect={handleBboxSelection}
-              result={result}
-              currentFrame={currentFrame}
-              bbox={bbox}
-              showEvacuationRoutes={showEvacuationRoutes}
-              selectedRoad={selectedRoad}
-              setSelectedRoad={setSelectedRoad}
-              disasterType={disasterType}
-              setDisasterType={handleDisasterSelect}
-            />
+            <ErrorBoundary>
+              <MapView
+                mapMode={mapMode}
+                setMapMode={setMapMode}
+                onBboxSelect={handleBboxSelection}
+                result={result}
+                currentFrame={currentFrame}
+                bbox={bbox}
+                showEvacuationRoutes={showEvacuationRoutes}
+                selectedRoad={selectedRoad}
+                setSelectedRoad={setSelectedRoad}
+                disasterType={disasterType}
+                setDisasterType={handleDisasterSelect}
+                focusedFacility={focusedFacility}
+                buildingDensity={buildingDensity}
+                isPlaying={isPlaying}
+              />
+            </ErrorBoundary>
 
             {/* Loading Overlay */}
             {loading && (
@@ -516,7 +669,7 @@ function App() {
 
             {/* Floating Timeline Bar OVER Map (Matching reference image) */}
             <div className="map-bottom-floating-timeline">
-              <button className="map-timeline-play-btn" onClick={togglePlay} title={isPlaying ? 'Pause' : 'Play'}>
+              <button className="map-timeline-play-btn" onClick={togglePlay} title={isPlaying ? 'Pause' : 'Play'} aria-label={isPlaying ? 'Pause simulation' : 'Play simulation'}>
                 {isPlaying ? <IconPause size={13} color="#ffffff" /> : <IconPlay size={13} color="#ffffff" />}
               </button>
 
@@ -527,6 +680,8 @@ function App() {
                 <input
                   type="range"
                   className="map-timeline-slider"
+                  id="map-timeline-slider"
+                  aria-label="Simulation timeline"
                   min={0}
                   max={Math.max(totalFrames - 1, 0)}
                   value={currentFrame}
@@ -552,7 +707,7 @@ function App() {
                 {formatTimelineHours(currentTime)}
               </div>
 
-              <div className="map-timeline-speed-pill" onClick={() => setPlaySpeed(playSpeed === 1 ? 2 : playSpeed === 2 ? 4 : 1)}>
+              <div className="map-timeline-speed-pill" onClick={() => setPlaySpeed(playSpeed === 1 ? 2 : playSpeed === 2 ? 4 : 1)} role="button" aria-label="Cycle playback speed" title="Cycle playback speed">
                 <span>{playSpeed}x</span>
                 <span className="speed-chevron">⌄</span>
               </div>
@@ -560,17 +715,23 @@ function App() {
           </div>
 
           {/* Right Control & Analytics Panel */}
+          <ErrorBoundary>
           <aside className="workspace-right-panel">
             {/* Card 1: Scenario Overview */}
             <div className="modern-scenario-card">
               <div className="scenario-card-header">
                 <span className="scenario-card-label">Scenario</span>
+                {isSynthetic && (
+                  <span className="synthetic-badge" title="Live sources failed; showing modeled fallback">
+                    Synthetic fallback data
+                  </span>
+                )}
                 <button className="scenario-change-btn" onClick={() => setShowScenarioModal(true)}>
                   Change
                 </button>
               </div>
               <div className="scenario-title-row">
-                <span>{disasterType === 'flood' ? '🌧️' : disasterType === 'cyclone' ? '🌀' : disasterType === 'earthquake' ? '🏚️' : disasterType === 'wildfire' ? '🔥' : '⛰️'}</span>
+                <span>{disasterIcon(disasterType, 16)}</span>
                 <span>
                   {disasterType === 'flood'
                     ? `${durationHours}-hour Extreme Rainfall`
@@ -579,7 +740,7 @@ function App() {
                     : disasterType === 'earthquake'
                     ? `Mw ${magnitude} Severe Earthquake`
                     : disasterType === 'wildfire'
-                    ? `${durationHours}-hour Extreme Heatwave`
+                    ? `${durationHours}-hour Wildfire`
                     : `${durationHours}-hour Monsoon Landslide`}
                 </span>
               </div>
@@ -805,86 +966,9 @@ function App() {
                 onClick={() => executeSimulation()}
                 disabled={loading}
               >
-                {loading ? '⏳ Calculating Simulation...' : '▶ Run Simulation'}
+                {loading ? 'Calculating Simulation…' : <><IconPlay size={12} color="#ffffff" className="svg-icon-inline" /> Run Simulation</>}
               </button>
             </div>
-
-            {/* Card: Simulation Timeline Scrubber */}
-            {result && (
-              <div className="floating-timeline-bar sidebar-timeline-card">
-                {lastCompletedRun && (
-                  <div className="timeline-active-run-hud" title={`Simulation Run UUID: ${result.run_uuid || lastCompletedRun.id}`}>
-                    <span className="live-status-dot" />
-                    <span className="hud-label">ACTIVE RUN #{lastCompletedRun.id}:</span>
-                    <span className="hud-summary">{lastCompletedRun.summary}</span>
-                    <span className="hud-time">({lastCompletedRun.time})</span>
-                  </div>
-                )}
-                <div className="timeline-controls-row">
-                  <div className="timeline-sidebar-header-row">
-                    <div className="timeline-header-label">
-                      Simulation Timeline ({totalSimulationHours.toFixed(0)} hours)
-                    </div>
-                    <div className="timeline-current-time-badge">
-                      {formatTimelineHours(currentTime)}
-                    </div>
-                  </div>
-
-                  <div className="timeline-scrubber-wrapper">
-                    <input
-                      type="range"
-                      className="timeline-slider"
-                      min={0}
-                      max={Math.max(totalFrames - 1, 0)}
-                      value={currentFrame}
-                      onChange={(e) => {
-                        setCurrentFrame(Number(e.target.value));
-                        setIsPlaying(false);
-                      }}
-                    />
-                    <div className="timeline-tick-labels">
-                      {Array.from({ length: 9 }).map((_, idx) => {
-                        const h = Math.round((idx / 8) * totalSimulationHours);
-                        return <span key={idx}>{h}h</span>;
-                      })}
-                    </div>
-                  </div>
-
-                  <div className="timeline-sidebar-actions-row">
-                    <button className="timeline-play-toggle" onClick={togglePlay} title={isPlaying ? 'Pause' : 'Play'}>
-                      {isPlaying ? '⏸' : '▶'}
-                    </button>
-                    <div className="timeline-step-btn-group">
-                      <button
-                        className="timeline-step-btn"
-                        onClick={() => setCurrentFrame((prev) => Math.max(0, prev - 1))}
-                        title="Previous Timestep"
-                      >
-                        ‹
-                      </button>
-                      <button
-                        className="timeline-step-btn"
-                        onClick={() => setCurrentFrame((prev) => Math.min(totalFrames - 1, prev + 1))}
-                        title="Next Timestep"
-                      >
-                        ›
-                      </button>
-                    </div>
-                    <div className="timeline-speed-controls">
-                      {[1, 2, 4].map((s) => (
-                        <button
-                          key={s}
-                          className={`speed-pill ${playSpeed === s ? 'speed-pill--active' : ''}`}
-                          onClick={() => setPlaySpeed(s)}
-                        >
-                          {s}x
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                </div>
-              </div>
-            )}
 
             {/* Card 2: Impact Summary (2x2 Grid) */}
             <div className="modern-impact-card">
@@ -892,57 +976,69 @@ function App() {
               <div className="impact-2x2-grid">
                 <div className="impact-2x2-tile">
                   <div className="impact-2x2-icon-box" style={{ background: 'rgba(2, 132, 199, 0.25)', color: '#38bdf8' }}>
-                    {disasterType === 'cyclone' ? '🌀' : disasterType === 'wildfire' ? '🔥' : disasterType === 'earthquake' ? '🏚️' : disasterType === 'landslide' ? '⛰️' : '💧'}
+                    {disasterIcon(disasterType, 16)}
                   </div>
                   <div className="impact-2x2-info">
                     <div className="impact-2x2-val">
                       {result && impact ? `${(impact.flooded_area_km2 ?? impact.affected_area_km2 ?? 0).toFixed(2)} km²` : '—'}
                     </div>
                     <div className="impact-2x2-label">
-                      {disasterType === 'flood' ? 'Estimated Flooded Area' : 'Estimated Impact Area'}
+                      {disasterType === 'flood' ? 'Estimated Flooded Area' : disasterType === 'wildfire' ? 'Estimated Burn Area' : disasterType === 'earthquake' ? 'Shaking Area (MMI VI+)' : disasterType === 'landslide' ? 'Unstable Slope Area' : disasterType === 'cyclone' ? 'Storm Impact Area' : 'Estimated Impact Area'}
                     </div>
                   </div>
                 </div>
 
                 <div className="impact-2x2-tile">
                   <div className="impact-2x2-icon-box" style={{ background: 'rgba(168, 85, 247, 0.25)', color: '#c084fc' }}>
-                    👥
+                    <IconPopulation size={16} />
                   </div>
                   <div className="impact-2x2-info">
                     <div className="impact-2x2-val">
                       {result && impact ? (impact.estimated_population_exposed ?? 0).toLocaleString() : '—'}
                     </div>
                     <div className="impact-2x2-label">Population Exposed</div>
+                    {result && impact && disasterType === 'earthquake' && (impact.estimated_fatalities || impact.estimated_injuries) ? (
+                      <div className="impact-2x2-sub">≈ {impact.estimated_fatalities ?? 0} deaths • {(impact.estimated_injuries ?? 0).toLocaleString()} injured</div>
+                    ) : result && impact && (disasterType === 'flood' || disasterType === 'cyclone') && (impact.estimated_displaced ?? 0) > 0 ? (
+                      <div className="impact-2x2-sub">≈ {(impact.estimated_displaced ?? 0).toLocaleString()} displaced</div>
+                    ) : result && impact && disasterType === 'wildfire' && (impact.population_smoke_exposed ?? 0) > 0 ? (
+                      <div className="impact-2x2-sub">≈ {(impact.population_smoke_exposed ?? 0).toLocaleString()} smoke-exposed</div>
+                    ) : result && impact && disasterType === 'landslide' && (impact.population_at_risk ?? 0) > 0 ? (
+                      <div className="impact-2x2-sub">≈ {(impact.population_at_risk ?? 0).toLocaleString()} at risk</div>
+                    ) : null}
                   </div>
                 </div>
 
                 <div className="impact-2x2-tile">
                   <div className="impact-2x2-icon-box" style={{ background: 'rgba(56, 189, 248, 0.15)', color: '#60a5fa' }}>
-                    🏢
+                    <IconBuilding size={16} />
                   </div>
                   <div className="impact-2x2-info">
                     <div className="impact-2x2-val">
                       {result && impact ? (impact.buildings_affected ?? 0).toLocaleString() : '—'}
                     </div>
-                    <div className="impact-2x2-label">Buildings Affected</div>
+                    <div className="impact-2x2-label">{disasterType === 'flood' ? 'Buildings Flooded' : disasterType === 'wildfire' ? 'Structures Burned' : disasterType === 'landslide' ? 'Buildings Buried / Damaged' : 'Buildings Damaged'}</div>
+                    {result && impact && (impact.buildings_summary?.buildings_destroyed ?? 0) > 0 && (
+                      <div className="impact-2x2-sub">{(impact.buildings_summary?.buildings_destroyed ?? 0).toLocaleString()} destroyed</div>
+                    )}
                   </div>
                 </div>
 
                 <div className="impact-2x2-tile">
                   <div className="impact-2x2-icon-box" style={{ background: 'rgba(56, 189, 248, 0.15)', color: '#38bdf8' }}>
-                    🛣️
+                    <IconRoad size={16} />
                   </div>
                   <div className="impact-2x2-info">
                     <div className="impact-2x2-val">
                       {result && roadStatus ? roadStatus.closed : '—'}
                     </div>
-                    <div className="impact-2x2-label">Road Segments Closed</div>
+                    <div className="impact-2x2-label">{disasterType === 'flood' ? 'Road Segments Closed' : disasterType === 'wildfire' ? 'Roads Blocked by Fire' : disasterType === 'landslide' ? 'Roads Buried / Blocked' : disasterType === 'earthquake' ? 'Roads Blocked by Debris' : 'Roads Blocked by Wind'}</div>
                   </div>
                 </div>
 
                 <div className="impact-2x2-tile impact-2x2-tile--full">
                   <div className="impact-2x2-icon-box" style={{ background: 'rgba(245, 158, 11, 0.25)', color: '#fbbf24' }}>
-                    ⚠️
+                    <IconAlertTriangle size={16} />
                   </div>
                   <div className="impact-2x2-info">
                     <div className="impact-2x2-val">
@@ -958,9 +1054,15 @@ function App() {
             <div className="modern-facilities-card">
               <div className="facilities-card-header">
                 <div className="facilities-card-title">Nearby Facilities</div>
-                <button className="facilities-view-all-btn" onClick={() => setShowProvenanceDrawer(true)}>
-                  View All ↗
-                </button>
+                {realFacilities.length > 4 && (
+                  <button
+                    className="facilities-view-all-btn"
+                    onClick={() => setShowAllFacilities((v) => !v)}
+                    aria-expanded={showAllFacilities}
+                  >
+                    {showAllFacilities ? 'Show Less' : `View All (${realFacilities.length}) ↗`}
+                  </button>
+                )}
               </div>
               <div className="facilities-list">
                 {result && displayFacilities.length > 0 ? (
@@ -975,7 +1077,25 @@ function App() {
                       : Math.max(3, Math.round((fac.distance_km ?? 0.8) * 12));
 
                     return (
-                      <div className="facility-list-row" key={fac.id || idx}>
+                      <div
+                        className="facility-list-row"
+                        key={fac.id || idx}
+                        role="button"
+                        tabIndex={0}
+                        title={`Show ${fac.name} on map`}
+                        aria-label={`Show ${fac.name} on map`}
+                        onClick={() => {
+                          setSelectedRoad(null);
+                          setFocusedFacility({ fac, nonce: Date.now() });
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.preventDefault();
+                            setSelectedRoad(null);
+                            setFocusedFacility({ fac, nonce: Date.now() });
+                          }
+                        }}
+                      >
                         <div className="facility-list-left">
                           <div
                             className="facility-icon-square"
@@ -996,7 +1116,7 @@ function App() {
                   })
                 ) : (
                   <div className="panel-standby-box">
-                    <span className="panel-standby-icon">📍</span>
+                    <span className="panel-standby-icon"><IconLocationPin size={20} /></span>
                     <div className="panel-standby-text">
                       {loading
                         ? 'Analyzing OpenStreetMap infrastructure...'
@@ -1011,7 +1131,7 @@ function App() {
             <div className="modern-ai-insight-card">
               <div className="ai-insight-title-row">
                 <div className="ai-insight-header-left">
-                  <span className="ai-insight-symbol">💡</span>
+                  <span className="ai-insight-symbol"><IconInsight size={14} /></span>
                   <span className="ai-insight-label">AI Insight</span>
                 </div>
                 <span className="ai-insight-beta-tag">Beta</span>
@@ -1027,6 +1147,7 @@ function App() {
               </div>
             </div>
           </aside>
+          </ErrorBoundary>
         </main>
 
 
@@ -1043,13 +1164,13 @@ function App() {
                 <div className="modal-title">Scenario Orchestrator</div>
                 <div className="modal-subtitle">Configure physics parameters or use AI natural language</div>
               </div>
-              <button className="modal-close-btn" onClick={() => setShowScenarioModal(false)}>✕</button>
+              <button className="modal-close-btn" onClick={() => setShowScenarioModal(false)} aria-label="Close scenario dialog">✕</button>
             </div>
 
             {/* Natural Language Prompt Box */}
             <form className="nl-prompt-form" onSubmit={handleNaturalLanguageSubmit}>
               <div className="nl-input-wrapper">
-                <span>🤖</span>
+                <span><IconInsight size={15} color="#38bdf8" className="svg-icon-inline" /></span>
                 <input
                   type="text"
                   placeholder="e.g. 'Simulate 250 mm rainfall in 18 hours with 2.5m surge'..."
@@ -1081,40 +1202,40 @@ function App() {
             {disasterType === 'flood' && (
               <div className="param-controls-grid">
                 <div className="param-field">
-                  <label>Rainfall: {rainfallMm} mm</label>
-                  <input type="range" min="20" max="1500" step="10" value={rainfallMm} onChange={(e) => setRainfallMm(Number(e.target.value))} />
+                  <label htmlFor="param-rainfall">Rainfall: {rainfallMm} mm</label>
+                  <input id="param-rainfall" type="range" min="20" max="1500" step="10" value={rainfallMm} onChange={(e) => setRainfallMm(Number(e.target.value))} />
                 </div>
                 <div className="param-field">
-                  <label>Duration: {durationHours} hours</label>
-                  <input type="range" min="1" max="72" step="1" value={durationHours} onChange={(e) => setDurationHours(Number(e.target.value))} />
+                  <label htmlFor="param-duration">Duration: {durationHours} hours</label>
+                  <input id="param-duration" type="range" min="1" max="72" step="1" value={durationHours} onChange={(e) => setDurationHours(Number(e.target.value))} />
                 </div>
                 <div className="param-field">
-                  <label>Coastal Storm Surge: {seaLevelSurge} m</label>
-                  <input type="range" min="0" max="8" step="0.2" value={seaLevelSurge} onChange={(e) => setSeaLevelSurge(Number(e.target.value))} />
+                  <label htmlFor="param-surge">Coastal Storm Surge: {seaLevelSurge} m</label>
+                  <input id="param-surge" type="range" min="0" max="8" step="0.2" value={seaLevelSurge} onChange={(e) => setSeaLevelSurge(Number(e.target.value))} />
                 </div>
               </div>
             )}
             {disasterType === 'earthquake' && (
               <div className="param-controls-grid">
                 <div className="param-field">
-                  <label>Magnitude: {magnitude} Mw</label>
-                  <input type="range" min="5.0" max="9.0" step="0.1" value={magnitude} onChange={(e) => setMagnitude(Number(e.target.value))} />
+                  <label htmlFor="param-magnitude">Magnitude: {magnitude} Mw</label>
+                  <input id="param-magnitude" type="range" min="5.0" max="9.0" step="0.1" value={magnitude} onChange={(e) => setMagnitude(Number(e.target.value))} />
                 </div>
                 <div className="param-field">
-                  <label>Focal Depth: {depthKm} km</label>
-                  <input type="range" min="2" max="100" step="2" value={depthKm} onChange={(e) => setDepthKm(Number(e.target.value))} />
+                  <label htmlFor="param-depth">Focal Depth: {depthKm} km</label>
+                  <input id="param-depth" type="range" min="2" max="100" step="2" value={depthKm} onChange={(e) => setDepthKm(Number(e.target.value))} />
                 </div>
               </div>
             )}
             {disasterType === 'cyclone' && (
               <div className="param-controls-grid">
                 <div className="param-field">
-                  <label>Max Wind Speed: {windSpeedKmh} km/h</label>
-                  <input type="range" min="60" max="280" step="5" value={windSpeedKmh} onChange={(e) => setWindSpeedKmh(Number(e.target.value))} />
+                  <label htmlFor="param-wind">Max Wind Speed: {windSpeedKmh} km/h</label>
+                  <input id="param-wind" type="range" min="60" max="280" step="5" value={windSpeedKmh} onChange={(e) => setWindSpeedKmh(Number(e.target.value))} />
                 </div>
                 <div className="param-field">
-                  <label>Central Pressure: {centralPressure} hPa</label>
-                  <input type="range" min="890" max="1000" step="5" value={centralPressure} onChange={(e) => setCentralPressure(Number(e.target.value))} />
+                  <label htmlFor="param-pressure">Central Pressure: {centralPressure} hPa</label>
+                  <input id="param-pressure" type="range" min="890" max="1000" step="5" value={centralPressure} onChange={(e) => setCentralPressure(Number(e.target.value))} />
                 </div>
               </div>
             )}
@@ -1129,6 +1250,44 @@ function App() {
         </div>
       )}
 
+      {/* ─── Settings Page (full view, opened from sidebar) ─── */}
+      {settingsPageOpen && (
+        <div className="settings-page">
+          <div className="settings-page-header">
+            <button className="settings-back-btn" onClick={() => setSettingsPageOpen(false)} aria-label="Back to dashboard">
+              ← Back
+            </button>
+            <div>
+              <div className="settings-page-title">Settings</div>
+              <div className="settings-page-sub">Display performance and map density</div>
+            </div>
+          </div>
+          <div className="settings-page-body">
+            <div className="modal-section-title">Buildings on Map</div>
+            <div className="settings-row">
+              <div className="settings-row-text">
+                <div className="settings-row-title">Building density</div>
+                <div className="settings-row-sub">Maximum shows every house (can slow down large areas). Medium caps the count and hides buildings until zoomed to street level.</div>
+              </div>
+              <div className="settings-pill-group" role="group" aria-label="Building density">
+                <button
+                  className={`settings-pill ${buildingDensity === 'medium' ? 'settings-pill--active' : ''}`}
+                  onClick={() => setBuildingDensity('medium')}
+                >
+                  Medium
+                </button>
+                <button
+                  className={`settings-pill ${buildingDensity === 'maximum' ? 'settings-pill--active' : ''}`}
+                  onClick={() => setBuildingDensity('maximum')}
+                >
+                  Maximum
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ─── Evidence & Data Provenance Drawer ──────────────────── */}
       {showProvenanceDrawer && (
         <div className="drawer-backdrop" onClick={() => setShowProvenanceDrawer(false)}>
@@ -1138,7 +1297,7 @@ function App() {
                 <div className="drawer-title">Data Provenance & Scientific Evidence</div>
                 <div className="drawer-subtitle">Inspect underlying authoritative datasets, versions, and physical equations</div>
               </div>
-              <button className="modal-close-btn" onClick={() => setShowProvenanceDrawer(false)}>✕</button>
+              <button className="modal-close-btn" onClick={() => setShowProvenanceDrawer(false)} aria-label="Close data provenance drawer">✕</button>
             </div>
 
             <div className="drawer-body">

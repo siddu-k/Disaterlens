@@ -7,20 +7,112 @@ interface Terrain3DViewerProps {
   onClose: () => void;
 }
 
+// Static 2D reference snapshot of the selected box (roads, buildings,
+// facilities + current hazard frame, north-up). No interaction.
+function AreaSnapshot({ result, currentFrame }: { result: SimulationResult; currentFrame: number }) {
+  const snapRef = useRef<HTMLCanvasElement>(null);
+
+  const box = result.aoi_bbox || result.bbox;
+  const aspect = (box.north - box.south) / Math.max(0.0001, box.east - box.west);
+  const W = 640;
+  const H = Math.round(Math.min(620, Math.max(300, W * aspect)));
+
+  useEffect(() => {
+    const canvas = snapRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const sim = result.simulation;
+    ctx.fillStyle = '#0a0f1d';
+    ctx.fillRect(0, 0, W, H);
+
+    const latSpan = Math.max(0.0001, box.north - box.south);
+    const lonSpan = Math.max(0.0001, box.east - box.west);
+    const X = (lon: number) => ((lon - box.west) / lonSpan) * W;
+    const Y = (lat: number) => ((box.north - lat) / latSpan) * H;
+
+    // Hazard frame cells (mapped by lat/lon from the sim grid)
+    const frames = sim.frames || [];
+    const grid = frames[Math.min(currentFrame, Math.max(0, frames.length - 1))] || [];
+    const rows = sim.rows || grid.length;
+    const cols = sim.cols || (grid[0] ? grid[0].length : 0);
+    const sb = result.bbox;
+    let peak = 0;
+    grid.forEach((row) => row.forEach((v) => { if (v > peak) peak = v; }));
+    peak = peak || 1;
+    // Exact-size cells: tile the selected box edge-to-edge, no gaps or overlap
+    const cw = W / Math.max(1, cols);
+    const ch = H / Math.max(1, rows);
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        const v = grid[r]?.[c] ?? 0;
+        if (v <= 0.01) continue;
+        const lat = sb.north - ((r + 0.5) / rows) * (sb.north - sb.south);
+        const lon = sb.west + ((c + 0.5) / cols) * (sb.east - sb.west);
+        const x = X(lon);
+        const y = Y(lat);
+        if (x < -cw || x > W + cw || y < -ch || y > H + ch) continue;
+        ctx.fillStyle = `rgba(37, 99, 235, ${(0.15 + 0.65 * Math.min(1, v / peak)).toFixed(2)})`;
+        ctx.fillRect(x - cw / 2, y - ch / 2, cw + 0.5, ch + 0.5);
+      }
+    }
+
+    // Roads colored by backend status
+    (result.geodata?.roads || []).forEach((road) => {
+      if (!road.coords || road.coords.length < 2) return;
+      ctx.beginPath();
+      road.coords.forEach((pt, i) => {
+        const x = X(pt[0]);
+        const y = Y(pt[1]);
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.strokeStyle =
+        road.status === 'closed' ? '#f87171' : road.status === 'restricted' ? '#fbbf24' : 'rgba(16, 185, 129, 0.55)';
+      ctx.lineWidth = 1.2;
+      ctx.stroke();
+    });
+
+    // Buildings as dots (red when hit)
+    const buildings = result.impact?.buildings || result.geodata?.buildings || [];
+    buildings.forEach((bldg: any) => {
+      const cent = bldg.centroid;
+      if (!cent) return;
+      ctx.fillStyle = bldg.flooded || bldg.affected ? '#f87171' : 'rgba(148, 163, 184, 0.6)';
+      ctx.fillRect(X(cent.lon) - 1, Y(cent.lat) - 1, 2, 2);
+    });
+
+    // Facilities as squares
+    (result.impact?.facilities || []).forEach((f: any) => {
+      ctx.fillStyle = f.type === 'hospital' ? '#ef4444' : f.type === 'shelter' ? '#34d399' : '#38bdf8';
+      ctx.fillRect(X(f.lon) - 2.5, Y(f.lat) - 2.5, 5, 5);
+    });
+
+    // Selected-box outline
+    ctx.strokeStyle = '#38bdf8';
+    ctx.setLineDash([6, 4]);
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(1, 1, W - 2, H - 2);
+    ctx.setLineDash([]);
+  }, [result, currentFrame, box, W, H]);
+
+  return <canvas ref={snapRef} width={W} height={H} className="terrain3d-snapshot-canvas" />;
+}
+
 export default function Terrain3DViewer({ result, currentFrame, onClose }: Terrain3DViewerProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
-  // Camera and visualization parameters
+  // Free-orbit camera: yaw wraps 360°, pitch 0° (horizon) → 90° (top-down)
   const [yaw, setYaw] = useState<number>(45); // degrees
   const [pitch, setPitch] = useState<number>(35); // degrees
   const [zoom, setZoom] = useState<number>(1.2);
   const [zExaggeration, setZExaggeration] = useState<number>(3.5);
-  const [showWater, setShowWater] = useState<boolean>(true);
-  const [showWireframe, setShowWireframe] = useState<boolean>(false);
-  const [showRoads, setShowRoads] = useState<boolean>(true);
-  const [showFacilities, setShowFacilities] = useState<boolean>(true);
   const [isDragging, setIsDragging] = useState<boolean>(false);
+  const draggingRef = useRef<boolean>(false);
   const lastMousePos = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const viewportRef = useRef<HTMLDivElement>(null);
+  const pinchRef = useRef<number | null>(null);
 
   const sim = result.simulation;
   const elev = result.elevation;
@@ -115,7 +207,7 @@ export default function Terrain3DViewer({ result, currentFrame, onClose }: Terra
       return { x: screenX, y: screenY, depth: pz };
     };
 
-    // Color mapper for Copernicus GLO-30 DEM elevation
+    // Color mapper: elevation bands with directional shading
     const getTerrainColor = (elevVal: number, slopeShade = 1.0) => {
       const t = Math.min(1.0, Math.max(0.0, (elevVal - minElev) / elevSpan));
       let r = 30, g = 58, b = 138;
@@ -185,6 +277,11 @@ export default function Terrain3DViewer({ result, currentFrame, onClose }: Terra
       const slopeShade = Math.max(0.65, Math.min(1.35, 1.0 + (dzX * 0.04 - dzY * 0.03)));
 
       const avgElev = (e00 + e10 + e11 + e01) / 4;
+      const w00 = waterGrid[r]?.[c] ?? 0;
+      const w10 = waterGrid[r]?.[c + 1] ?? 0;
+      const w11 = waterGrid[r + 1]?.[c + 1] ?? 0;
+      const w01 = waterGrid[r + 1]?.[c] ?? 0;
+      const avgWater = (w00 + w10 + w11 + w01) / 4;
 
       // Draw Terrain Face
       ctx.beginPath();
@@ -194,54 +291,44 @@ export default function Terrain3DViewer({ result, currentFrame, onClose }: Terra
       ctx.lineTo(p01.x, p01.y);
       ctx.closePath();
 
-      if (!showWireframe) {
-        ctx.fillStyle = getTerrainColor(avgElev, slopeShade);
-        ctx.fill();
-      }
+      ctx.fillStyle = getTerrainColor(avgElev, slopeShade);
+      ctx.fill();
 
-      ctx.strokeStyle = showWireframe ? '#38bdf8' : 'rgba(15, 23, 42, 0.45)';
-      ctx.lineWidth = showWireframe ? 1 : 0.6;
+      ctx.strokeStyle = 'rgba(15, 23, 42, 0.45)';
+      ctx.lineWidth = 0.6;
       ctx.stroke();
 
       // Render 3D Water / Hazard Plane if flooded
-      if (showWater) {
-        const w00 = waterGrid[r]?.[c] ?? 0;
-        const w10 = waterGrid[r]?.[c + 1] ?? 0;
-        const w11 = waterGrid[r + 1]?.[c + 1] ?? 0;
-        const w01 = waterGrid[r + 1]?.[c] ?? 0;
-        const avgWater = (w00 + w10 + w11 + w01) / 4;
+      if (avgWater > 0.03) {
+        const wp00 = project(u0, v0, e00 + w00);
+        const wp10 = project(u1, v0, e10 + w10);
+        const wp11 = project(u1, v1, e11 + w11);
+        const wp01 = project(u0, v1, e01 + w01);
 
-        if (avgWater > 0.03) {
-          const wp00 = project(u0, v0, e00 + w00);
-          const wp10 = project(u1, v0, e10 + w10);
-          const wp11 = project(u1, v1, e11 + w11);
-          const wp01 = project(u0, v1, e01 + w01);
+        ctx.beginPath();
+        ctx.moveTo(wp00.x, wp00.y);
+        ctx.lineTo(wp10.x, wp10.y);
+        ctx.lineTo(wp11.x, wp11.y);
+        ctx.lineTo(wp01.x, wp01.y);
+        ctx.closePath();
 
-          ctx.beginPath();
-          ctx.moveTo(wp00.x, wp00.y);
-          ctx.lineTo(wp10.x, wp10.y);
-          ctx.lineTo(wp11.x, wp11.y);
-          ctx.lineTo(wp01.x, wp01.y);
-          ctx.closePath();
+        const alpha = Math.min(0.85, 0.45 + (avgWater / 3.0) * 0.4);
+        ctx.fillStyle = `rgba(37, 99, 235, ${alpha})`;
+        ctx.fill();
 
-          const alpha = Math.min(0.85, 0.45 + (avgWater / 3.0) * 0.4);
-          ctx.fillStyle = `rgba(37, 99, 235, ${alpha})`;
-          ctx.fill();
-
-          ctx.strokeStyle = 'rgba(147, 197, 253, 0.6)';
-          ctx.lineWidth = 0.8;
-          ctx.stroke();
-        }
+        ctx.strokeStyle = 'rgba(147, 197, 253, 0.6)';
+        ctx.lineWidth = 0.8;
+        ctx.stroke();
       }
     });
 
     // Render 3D Roads Network
-    if (showRoads && result.geodata?.roads) {
+    {
       const b = result.bbox;
       const latSpan = Math.max(0.001, b.north - b.south);
       const lonSpan = Math.max(0.001, b.east - b.west);
 
-      result.geodata.roads.slice(0, 80).forEach((road: RoadFeature) => {
+      (result.geodata?.roads || []).forEach((road: RoadFeature) => {
         if (road.coords.length < 2) return;
         ctx.beginPath();
         road.coords.forEach((coord, i) => {
@@ -264,12 +351,12 @@ export default function Terrain3DViewer({ result, currentFrame, onClose }: Terra
     }
 
     // Render 3D Facilities Beacons
-    if (showFacilities && result.impact?.facilities) {
+    {
       const b = result.bbox;
       const latSpan = Math.max(0.001, b.north - b.south);
       const lonSpan = Math.max(0.001, b.east - b.west);
 
-      result.impact.facilities.slice(0, 10).forEach((f: Facility) => {
+      (result.impact?.facilities || []).forEach((f: Facility) => {
         const u = (f.lon - b.west) / lonSpan;
         const v = (b.north - f.lat) / latSpan;
         const r = Math.min(rows - 1, Math.max(0, Math.floor(v * rows)));
@@ -299,15 +386,54 @@ export default function Terrain3DViewer({ result, currentFrame, onClose }: Terra
         ctx.stroke();
       });
     }
+
+    // Render 3D Buildings as extruded damage columns (full selection, affected first)
+    {
+      const b = result.bbox;
+      const latSpan = Math.max(0.001, b.north - b.south);
+      const lonSpan = Math.max(0.001, b.east - b.west);
+
+      const buildings = [...(result.impact?.buildings || [])]
+        .sort(
+          (x: any, y: any) =>
+            Number(y.flooded || y.affected) - Number(x.flooded || x.affected)
+        );
+
+      buildings.forEach((bd: any) => {
+        const cent = bd.centroid;
+        if (!cent || typeof cent.lat !== 'number' || typeof cent.lon !== 'number') return;
+        const u = (cent.lon - b.west) / lonSpan;
+        const v = (b.north - cent.lat) / latSpan;
+        if (u < 0 || u > 1 || v < 0 || v > 1) return;
+        const r = Math.min(rows - 1, Math.max(0, Math.floor(v * rows)));
+        const c = Math.min(cols - 1, Math.max(0, Math.floor(u * cols)));
+        const groundE = elevGrid[r]?.[c] ?? minElev;
+        const heightM = Math.max(1.5, bd.height_m || (bd.levels || 1) * 3.2);
+
+        const base = project(u, v, groundE);
+        const top = project(u, v, groundE + heightM);
+
+        const hit = bd.flooded || bd.affected;
+        const col = hit ? '#f87171' : 'rgba(56, 189, 248, 0.85)';
+
+        // Vertical damage column (constant screen width reads correctly from any yaw)
+        ctx.beginPath();
+        ctx.moveTo(base.x, base.y);
+        ctx.lineTo(top.x, top.y);
+        ctx.strokeStyle = col;
+        ctx.lineWidth = 3;
+        ctx.stroke();
+
+        // Cap square at roof height
+        ctx.fillStyle = col;
+        ctx.fillRect(top.x - 2.5, top.y - 2.5, 5, 5);
+      });
+    }
   }, [
     yaw,
     pitch,
     zoom,
     zExaggeration,
-    showWater,
-    showWireframe,
-    showRoads,
-    showFacilities,
     elevGrid,
     waterGrid,
     rows,
@@ -317,27 +443,91 @@ export default function Terrain3DViewer({ result, currentFrame, onClose }: Terra
     result,
   ]);
 
+  // Non-passive wheel listener: smooth exponential zoom without browser warnings
+  useEffect(() => {
+    const el = viewportRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      setZoom((prev) => Math.max(0.5, Math.min(4.0, prev * Math.exp(-e.deltaY * 0.0012))));
+    };
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  }, []);
+
+  // Free orbit: drag anywhere — full 360° on yaw AND pitch (flip over the top / underneath)
+  const orbitBy = (dx: number, dy: number) => {
+    setYaw((prev) => (prev + dx * 0.5 + 360) % 360);
+    setPitch((prev) => (prev + dy * 0.5 + 360) % 360);
+  };
+
   // Mouse drag to orbit
   const handleMouseDown = (e: React.MouseEvent) => {
     setIsDragging(true);
+    draggingRef.current = true;
     lastMousePos.current = { x: e.clientX, y: e.clientY };
   };
 
   const handleMouseMove = (e: React.MouseEvent) => {
-    if (!isDragging) return;
+    if (!draggingRef.current) return;
     const dx = e.clientX - lastMousePos.current.x;
     const dy = e.clientY - lastMousePos.current.y;
     lastMousePos.current = { x: e.clientX, y: e.clientY };
-
-    setYaw((prev) => (prev + dx * 0.5) % 360);
-    setPitch((prev) => Math.max(10, Math.min(85, prev + dy * 0.5)));
+    orbitBy(dx, dy);
   };
 
-  const handleMouseUp = () => setIsDragging(false);
+  const endDrag = () => {
+    setIsDragging(false);
+    draggingRef.current = false;
+    pinchRef.current = null;
+  };
 
-  const handleWheel = (e: React.WheelEvent) => {
+  // Touch: 1 finger orbits, 2-finger pinch zooms
+  const handleTouchStart = (e: React.TouchEvent) => {
+    if (e.touches.length === 2) {
+      draggingRef.current = false;
+      setIsDragging(false);
+      pinchRef.current = Math.hypot(
+        e.touches[0].clientX - e.touches[1].clientX,
+        e.touches[0].clientY - e.touches[1].clientY
+      );
+    } else if (e.touches.length === 1) {
+      draggingRef.current = true;
+      setIsDragging(true);
+      lastMousePos.current = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+    }
+  };
+
+  const handleTouchMove = (e: React.TouchEvent) => {
+    if (e.touches.length === 2) {
+      const d = Math.hypot(
+        e.touches[0].clientX - e.touches[1].clientX,
+        e.touches[0].clientY - e.touches[1].clientY
+      );
+      if (pinchRef.current && pinchRef.current > 0) {
+        const ratio = d / pinchRef.current;
+        setZoom((prev) => Math.max(0.5, Math.min(4.0, prev * ratio)));
+      }
+      pinchRef.current = d;
+    } else if (e.touches.length === 1 && draggingRef.current) {
+      const dx = e.touches[0].clientX - lastMousePos.current.x;
+      const dy = e.touches[0].clientY - lastMousePos.current.y;
+      lastMousePos.current = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+      orbitBy(dx, dy);
+    }
+  };
+
+  // Keyboard orbit + zoom (viewport is focusable)
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    const step = e.shiftKey ? 10 : 3;
+    if (e.key === 'ArrowLeft') setYaw((p) => (p - step + 360) % 360);
+    else if (e.key === 'ArrowRight') setYaw((p) => (p + step) % 360);
+    else if (e.key === 'ArrowUp') setPitch((p) => (p + step) % 360);
+    else if (e.key === 'ArrowDown') setPitch((p) => (p - step + 360) % 360);
+    else if (e.key === '+' || e.key === '=') setZoom((z) => Math.min(4.0, z * 1.12));
+    else if (e.key === '-' || e.key === '_') setZoom((z) => Math.max(0.5, z / 1.12));
+    else return;
     e.preventDefault();
-    setZoom((prev) => Math.max(0.6, Math.min(3.0, prev - e.deltaY * 0.001)));
   };
 
   return (
@@ -345,128 +535,78 @@ export default function Terrain3DViewer({ result, currentFrame, onClose }: Terra
       <div className="terrain3d-container">
         {/* Header HUD */}
         <div className="terrain3d-header">
-          <div className="terrain3d-title-group">
-            <div className="terrain3d-badge">
-              <span className="terrain3d-pulse-dot" />
-              <span>Copernicus GLO-30 DEM Calibrated</span>
-            </div>
-            <h2 className="terrain3d-title">3D Digital Elevation Relief & Hydrodynamic Simulator</h2>
-            <p className="terrain3d-subtitle">
-              Sensor: TanDEM-X / Sentinel-1 Radar Interferometry • Datum: EGM96 Geoid • Resolution: 30m posting
-            </p>
-          </div>
-
-          <div className="terrain3d-actions">
-            <button
-              className="terrain3d-btn terrain3d-btn--reset"
-              onClick={() => {
-                setYaw(45);
-                setPitch(35);
-                setZoom(1.2);
-                setZExaggeration(3.5);
-              }}
-              title="Reset Camera View"
-            >
-              🧭 Reset View
-            </button>
+          <div className="terrain3d-actions" style={{ marginLeft: 'auto' }}>
             <button className="terrain3d-btn terrain3d-btn--close" onClick={onClose} title="Close 3D Mode">
               ✕ Exit 3D
             </button>
           </div>
         </div>
 
+        {/* Body: 2D reference left, 3D right */}
+        <div className="terrain3d-body">
+          <div className="terrain3d-snapshot-pane">
+            <div className="terrain3d-snapshot-title">Selected Area — 2D Reference</div>
+            <AreaSnapshot result={result} currentFrame={currentFrame} />
+            <div className="terrain3d-snapshot-meta">
+              {(result.geodata?.roads?.length || 0).toLocaleString()} roads •{' '}
+              {(result.impact?.buildings?.length || result.geodata?.buildings?.length || 0).toLocaleString()}{' '}
+              buildings • {(result.impact?.facilities?.length || 0).toLocaleString()} facilities
+              <br />
+              Frame #{currentFrame} • North up
+            </div>
+          </div>
+          <div className="terrain3d-view3d-pane">
         {/* 3D Viewport */}
         <div
+          ref={viewportRef}
           className="terrain3d-viewport"
+          tabIndex={0}
+          role="application"
+          aria-label="3D terrain viewport. Arrow keys orbit, plus and minus zoom."
           onMouseDown={handleMouseDown}
           onMouseMove={handleMouseMove}
-          onMouseUp={handleMouseUp}
-          onMouseLeave={handleMouseUp}
-          onWheel={handleWheel}
+          onMouseUp={endDrag}
+          onMouseLeave={endDrag}
+          onTouchStart={handleTouchStart}
+          onTouchMove={handleTouchMove}
+          onTouchEnd={endDrag}
+          onKeyDown={handleKeyDown}
           style={{ cursor: isDragging ? 'grabbing' : 'grab' }}
         >
           <canvas ref={canvasRef} className="terrain3d-canvas" />
 
-          {/* Interactive Calibration Spec HUD */}
-          <div className="terrain3d-hud-specs">
-            <div className="terrain3d-spec-row">
-              <span className="terrain3d-spec-label">Vertical Datum</span>
-              <span className="terrain3d-spec-val">EGM96 (Global Geoid)</span>
-            </div>
-            <div className="terrain3d-spec-row">
-              <span className="terrain3d-spec-label">Spatial Posting</span>
-              <span className="terrain3d-spec-val">30m × 30m Grid</span>
-            </div>
-            <div className="terrain3d-spec-row">
-              <span className="terrain3d-spec-label">Elevation Min / Max</span>
-              <span className="terrain3d-spec-val">
-                {minElev.toFixed(1)}m – {maxElev.toFixed(1)}m ({Math.round(maxElev - minElev)}m Relief)
-              </span>
-            </div>
-            <div className="terrain3d-spec-row">
-              <span className="terrain3d-spec-label">Vertical Accuracy</span>
-              <span className="terrain3d-spec-val" style={{ color: '#34d399' }}>
-                &lt; 4.0m LE90 (Validated)
-              </span>
-            </div>
-            <div className="terrain3d-spec-row">
-              <span className="terrain3d-spec-label">Simulated Timeline</span>
-              <span className="terrain3d-spec-val" style={{ color: '#38bdf8' }}>
-                Frame #{currentFrame} (t = {currentFrame}h)
-              </span>
-            </div>
-          </div>
-
-          {/* Camera Instructions Hint */}
-          <div className="terrain3d-interaction-hint">
-            <span>🖱️ Drag to Rotate (Orbit) • Scroll to Zoom • Watch Water Inundate Lowland Basins</span>
-          </div>
-        </div>
-
-        {/* Controls Toolbar */}
-        <div className="terrain3d-toolbar">
-          <div className="terrain3d-slider-group">
-            <label className="terrain3d-slider-label">
-              <span>Vertical Exaggeration: </span>
-              <strong>{zExaggeration.toFixed(1)}×</strong>
-            </label>
+          {/* Vertical height adjuster */}
+          <div className="terrain3d-height-float" title="Vertical height exaggeration">
+            <span>Height</span>
             <input
               type="range"
-              min="1.0"
-              max="8.0"
+              min="1"
+              max="8"
               step="0.5"
               value={zExaggeration}
               onChange={(e) => setZExaggeration(parseFloat(e.target.value))}
-              className="terrain3d-range"
+              className="terrain3d-height-range"
+              aria-label="Vertical height exaggeration"
             />
+            <strong className="terrain3d-height-val">{zExaggeration.toFixed(1)}×</strong>
           </div>
 
-          <div className="terrain3d-toggle-group">
-            <button
-              className={`terrain3d-toggle-btn ${showWater ? 'terrain3d-toggle-btn--active' : ''}`}
-              onClick={() => setShowWater(!showWater)}
-            >
-              🌊 Flood Layer
-            </button>
-            <button
-              className={`terrain3d-toggle-btn ${showRoads ? 'terrain3d-toggle-btn--active' : ''}`}
-              onClick={() => setShowRoads(!showRoads)}
-            >
-              🛣️ OSM Roads
-            </button>
-            <button
-              className={`terrain3d-toggle-btn ${showFacilities ? 'terrain3d-toggle-btn--active' : ''}`}
-              onClick={() => setShowFacilities(!showFacilities)}
-            >
-              🏥 3D Beacons
-            </button>
-            <button
-              className={`terrain3d-toggle-btn ${showWireframe ? 'terrain3d-toggle-btn--active' : ''}`}
-              onClick={() => setShowWireframe(!showWireframe)}
-            >
-              📐 Wireframe
-            </button>
+
           </div>
+          <div className="terrain3d-zoombar">
+            <span>Zoom</span>
+            <input
+              type="range"
+              min="0.5"
+              max="4"
+              step="0.1"
+              value={zoom}
+              onChange={(e) => setZoom(Number(e.target.value))}
+              aria-label="3D zoom"
+            />
+            <strong>{zoom.toFixed(1)}×</strong>
+          </div>
+        </div>
         </div>
       </div>
     </div>

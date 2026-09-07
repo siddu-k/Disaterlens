@@ -8,8 +8,11 @@ barometer surge, and coastal wind setup inundation against terrain.
 
 import numpy as np
 import math
+import logging
 from typing import Dict, Any, List, Tuple, Optional
 from simulation.base import BaseHazardModule, HazardOutput
+
+logger = logging.getLogger(__name__)
 
 
 class CycloneHazardModule(BaseHazardModule):
@@ -60,7 +63,7 @@ class CycloneHazardModule(BaseHazardModule):
 
         rows, cols = elevation.shape
         if bbox is None:
-            bbox = {"south": 18.98, "west": 72.81, "north": 19.03, "east": 72.86}
+            raise ValueError("bbox is required")
 
         center_lat = (bbox["north"] + bbox["south"]) / 2.0
         center_lon = (bbox["east"] + bbox["west"]) / 2.0
@@ -116,6 +119,18 @@ class CycloneHazardModule(BaseHazardModule):
             frames.append(np.round(step_wind, 1).tolist())
             max_wind_grid = np.maximum(max_wind_grid, step_wind)
 
+        # Surge inundation depth grid (meters): hydrostatic flooding of
+        # low-lying terrain up to the computed coastal surge height.
+        # max_hazard semantics stay as wind (km/h); surge is supplemental.
+        try:
+            min_elev = float(np.nanmin(elevation))
+            surge_level = min_elev + total_coastal_surge_m
+            surge_grid = np.maximum(surge_level - elevation, 0.0)
+            surge_grid = np.where(np.isnan(elevation), 0.0, surge_grid)
+        except Exception:
+            surge_grid = np.zeros((rows, cols), dtype=np.float64)
+        max_surge_m = round(float(np.max(surge_grid)) if surge_grid.size else 0.0, 2)
+
         return HazardOutput(
             disaster_type="cyclone",
             model_name=self.model_name,
@@ -132,6 +147,8 @@ class CycloneHazardModule(BaseHazardModule):
                 "peak_wind_kmh": round(float(np.max(max_wind_grid)), 1),
                 "estimated_coastal_surge_m": round(total_coastal_surge_m, 2),
                 "saffir_simpson_category": _get_cyclone_category(max_wind_kmh),
+                "surge_grid": np.round(surge_grid, 3).tolist(),
+                "max_surge_m": max_surge_m,
             },
         )
 

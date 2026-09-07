@@ -8,10 +8,82 @@ Includes spatial caching and pre-cached real data for offline expo reliability.
 
 import requests
 import math
+import time
+import logging
 from typing import Dict, Any, List, Optional
 import config
 from db.spatial_store import get_cached_geodata, save_cached_geodata
 from geodata.cached_scenarios import get_pre_cached_mumbai_geodata, MUMBAI_GS_WARD_BBOX
+
+logger = logging.getLogger(__name__)
+
+_OVERPASS_HEADERS = {
+    "User-Agent": "DisasterLens/2.0 (contact@disasterlens.org; disaster response live research platform)"
+}
+
+# Split-fetch strategy: one giant query (roads+buildings+amenities) is what
+# makes Overpass time out (504). Roads/amenities are light; buildings are heavy.
+_LIGHT_TIMEOUT_S = 25
+_BUILDINGS_TIMEOUT_S = 75
+_RETRY_BACKOFF_S = 2.0
+
+_ROADS_AMENITIES_QUERY = """
+[out:json][timeout:25];
+(
+  way["highway"]({bbox});
+  nwr["amenity"~"^(hospital|shelter|school|police|fire_station)$"]({bbox});
+);
+out geom;
+"""
+
+_BUILDINGS_QUERY = """
+[out:json][timeout:60];
+(
+  way["building"]({bbox});
+  relation["building"]({bbox});
+);
+out geom;
+"""
+
+
+def _overpass_servers() -> List[str]:
+    """Primary instance first, then configured mirrors (deduplicated)."""
+    urls = [config.OVERPASS_API_URL] + list(getattr(config, "OVERPASS_MIRRORS", []) or [])
+    seen: List[str] = []
+    for u in urls:
+        if u and u not in seen:
+            seen.append(u)
+    return seen
+
+
+def _fetch_overpass_elements(query: str, timeout_s: int, label: str) -> List[Dict[str, Any]]:
+    """POST one Overpass query with retry + mirror failover. Returns elements list.
+
+    Primary server is tried twice (short backoff between), then each mirror once.
+    Raises the last exception if every endpoint fails.
+    """
+    last_exc: Optional[Exception] = None
+    for idx, url in enumerate(_overpass_servers()):
+        attempts = 2 if idx == 0 else 1
+        for attempt in range(attempts):
+            try:
+                response = requests.post(
+                    url,
+                    data={"data": query},
+                    headers=_OVERPASS_HEADERS,
+                    timeout=timeout_s,
+                )
+                response.raise_for_status()
+                data = response.json()
+                elements = data.get("elements", [])
+                logger.info(f"[OSM] {label}: received {len(elements)} elements from {url}")
+                return elements
+            except Exception as e:
+                last_exc = e
+                logger.warning(f"[OSM] {label} request failed ({url}, attempt {attempt + 1}/{attempts}): {e}")
+                if attempt + 1 < attempts:
+                    time.sleep(_RETRY_BACKOFF_S)
+    raise last_exc if last_exc is not None else RuntimeError("Overpass request failed")
 
 
 def fetch_geodata(
@@ -22,38 +94,44 @@ def fetch_geodata(
 ) -> Dict[str, Any]:
     """
     Fetch all relevant geospatial data live for the exact requested bounding box from OSM Overpass.
-    No hardcoded datasets or local caching: all queries are fetched live in real-time.
+    Split-fetch: light roads/amenities query first, heavy buildings query separately —
+    each with retry + mirror failover. Partial success is kept (real parts stay real,
+    failed parts fall back to synthetic). Fully-live payloads are cached; synthetic
+    payloads are never cached so the next run retries live sources.
     """
     bbox = f"{south},{west},{north},{east}"
-    print(f"[OSM] Live fetch from Overpass API for AOI bbox: {bbox}")
-    
-    query = f"""
-    [out:json][timeout:30];
-    (
-      way["highway"]({bbox});
-      way["building"]({bbox});
-      relation["building"]({bbox});
-      nwr["amenity"~"^(hospital|shelter|school|police|fire_station)$"]({bbox});
-    );
-    out geom;
-    """
-    
-    headers = {
-        "User-Agent": "DisasterLens/2.0 (contact@disasterlens.org; disaster response live research platform)"
-    }
+    logger.info(f"[OSM] Live fetch from Overpass API for AOI bbox: {bbox}")
+
+    # 0. Check spatial cache first for instant response (read path; write path unchanged below)
     try:
-        response = requests.post(
-            config.OVERPASS_API_URL,
-            data={"data": query},
-            headers=headers,
-            timeout=18,
-        )
-        response.raise_for_status()
-        data = response.json()
-        elements = data.get("elements", [])
-        print(f"[OSM] Received {len(elements)} raw elements live from Overpass for {bbox}")
+        cached = get_cached_geodata(south, west, north, east)
     except Exception as e:
-        print(f"[OSM] Live Overpass request notice: {e}. Generating procedural geodata for exact requested bbox.")
+        logger.warning(f"[OSM Cache] Notice: {e}")
+        cached = None
+    if cached is not None:
+        if "is_synthetic" not in cached:
+            cached["is_synthetic"] = False
+        return cached
+    
+    # 1. Split live fetch (see module docstring for rationale). Each part is
+    # independent: if one fails we keep the other instead of discarding everything.
+    synthetic_parts: List[str] = []
+    elements: List[Dict[str, Any]] = []
+    try:
+        elements.extend(_fetch_overpass_elements(
+            _ROADS_AMENITIES_QUERY.format(bbox=bbox), _LIGHT_TIMEOUT_S, "roads+amenities"))
+    except Exception as e:
+        synthetic_parts.extend(["roads", "amenities"])
+        logger.warning(f"[OSM] roads/amenities unavailable for {bbox}: {e}")
+    try:
+        elements.extend(_fetch_overpass_elements(
+            _BUILDINGS_QUERY.format(bbox=bbox), _BUILDINGS_TIMEOUT_S, "buildings"))
+    except Exception as e:
+        synthetic_parts.append("buildings")
+        logger.warning(f"[OSM] buildings unavailable for {bbox}: {e}")
+
+    if len(synthetic_parts) >= 3:  # every part failed — full procedural fallback
+        logger.warning(f"[OSM] All Overpass requests failed for {bbox}. Generating procedural geodata.")
         return _generate_local_geodata(south, west, north, east)
 
     # Parse elements
@@ -117,11 +195,12 @@ def fetch_geodata(
                     "flooded": False,
                     "flood_depth": 0.0,
                     "addr_street": road["name"],
+                    "source": "synthetic",
                     "raw_tags": {
                         "building": b_type,
                         "building:levels": str(levels),
                         "addr:street": road["name"],
-                        "source": "OpenStreetMap",
+                        "source": "synthetic",
                     }
                 })
 
@@ -147,7 +226,16 @@ def fetch_geodata(
         },
         "is_cached_validation_dataset": False,
         "dataset_name": f"OSM Bounding Box ({round(south,3)}, {round(west,3)} to {round(north,3)}, {round(east,3)})",
+        "is_synthetic": bool(synthetic_parts),
+        "synthetic_parts": synthetic_parts,
     }
+    if not synthetic_parts:
+        # Cache only fully-live payloads. Synthetic fallbacks must retry live
+        # sources on the next run instead of being served from cache forever.
+        try:
+            save_cached_geodata(south, west, north, east, result)
+        except Exception as e:
+            logger.warning(f"[OSM Cache] live save failed: {e}")
     return result
 
 
@@ -477,8 +565,12 @@ def _generate_local_geodata(south: float, west: float, north: float, east: float
         },
         "is_cached_validation_dataset": False,
         "dataset_name": f"Area of Interest ({south:.3f}, {west:.3f} to {north:.3f}, {east:.3f})",
+        "is_synthetic": True,
     }
-    save_cached_geodata(south, west, north, east, result)
+    # Tag every procedurally generated feature as synthetic (never OpenStreetMap).
+    # NOTE: intentionally NOT cached — the next run must retry live Overpass.
+    for _feat in roads + result["buildings"] + hospitals + shelters + police + fire:
+        _feat["source"] = "synthetic"
     return result
 
 
@@ -519,7 +611,7 @@ def _attach_road_elevations(roads: List[Dict], south: float, west: float, north:
                     road_len = max(road.get("length_m", 100.0), 10.0)
                     road["slope_pct"] = round((diff / road_len) * 100.0, 1)
     except Exception as e:
-        print(f"[OSM Elevation] Notice: {e}")
+        logger.warning(f"[OSM Elevation] Notice: {e}")
 
     # Fallback to ensure NO road is left without elevation data
     for road in roads:

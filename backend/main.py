@@ -9,15 +9,20 @@ import sys
 import os
 import uuid
 import time
-from typing import Optional, List, Dict, Any
+import hashlib
+import threading
+import logging
+from typing import Optional, List, Dict, Any, Literal
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 # Add backend directory to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 import config
 from geodata.elevation import fetch_elevation_grid
@@ -36,48 +41,129 @@ app = FastAPI(
     version="2.0.0",
 )
 
-# CORS for frontend dev server
+# CORS for frontend dev server (explicit origins so credentials remain valid)
+_FRONTEND_ORIGINS = [
+    o.strip() for o in os.environ.get(
+        "FRONTEND_ORIGINS", "http://localhost:5173,http://localhost:3000"
+    ).split(",") if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_FRONTEND_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-session_cache: Dict[str, Any] = {}
+
+class _SessionTTLCache:
+    """Small bounded TTL cache for session scenario state."""
+
+    def __init__(self, max_entries: int = 32, ttl_s: float = 30 * 60):
+        self._store: Dict[str, Any] = {}
+        self._expiry: Dict[str, float] = {}
+        self._max = max_entries
+        self._ttl = ttl_s
+        self._lock = threading.Lock()
+
+    def _purge_expired(self) -> None:
+        now = time.time()
+        for k in [k for k, exp in self._expiry.items() if exp <= now]:
+            self._store.pop(k, None)
+            self._expiry.pop(k, None)
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        with self._lock:
+            self._purge_expired()
+            if key not in self._store and len(self._store) >= self._max:
+                # Evict oldest entry
+                oldest = min(self._expiry, key=lambda k: self._expiry[k])
+                self._store.pop(oldest, None)
+                self._expiry.pop(oldest, None)
+            self._store[key] = value
+            self._expiry[key] = time.time() + self._ttl
+
+    def __getitem__(self, key: str) -> Any:
+        with self._lock:
+            exp = self._expiry.get(key)
+            if exp is None or exp <= time.time():
+                self._store.pop(key, None)
+                self._expiry.pop(key, None)
+                raise KeyError(key)
+            return self._store[key]
+
+    def get(self, key: str, default: Any = None) -> Any:
+        try:
+            return self.__getitem__(key)
+        except KeyError:
+            return default
+
+    def __contains__(self, key: str) -> bool:
+        try:
+            self.__getitem__(key)
+            return True
+        except KeyError:
+            return False
+
+
+session_cache = _SessionTTLCache(max_entries=32, ttl_s=30 * 60)
+
+
+def _scenario_cache_key(bbox: Dict[str, float], disaster_type: str, params: Dict[str, Any]) -> str:
+    parts = [
+        f"{bbox.get('south')},{bbox.get('west')},{bbox.get('north')},{bbox.get('east')}",
+        str(disaster_type),
+    ]
+    for k in sorted(params):
+        v = params[k]
+        if isinstance(v, (dict, list)):
+            v = repr(v)
+        parts.append(f"{k}={v}")
+    return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()
 
 
 # ─── Pydantic Request Models ──────────────────────────────────────
 
 class BoundingBox(BaseModel):
-    south: float
-    west: float
-    north: float
-    east: float
+    south: float = Field(ge=-90, le=90)
+    west: float = Field(ge=-180, le=180)
+    north: float = Field(ge=-90, le=90)
+    east: float = Field(ge=-180, le=180)
+
+    @model_validator(mode="after")
+    def _check_bbox(self):
+        if not (self.south < self.north):
+            raise ValueError("BoundingBox requires south < north")
+        if not (self.west < self.east):
+            raise ValueError("BoundingBox requires west < east")
+        area = (self.north - self.south) * (self.east - self.west)
+        if area > 4.0:
+            raise ValueError(f"BoundingBox area {area:.2f} deg² exceeds 4.0 deg² limit")
+        return self
 
 
 class SimulationRequest(BaseModel):
     bbox: BoundingBox
-    disaster_type: str = Field(default="flood", description="flood, earthquake, wildfire, landslide, cyclone")
+    disaster_type: Literal["flood", "cyclone", "earthquake", "wildfire", "landslide"] = Field(default="flood", description="flood, earthquake, wildfire, landslide, cyclone")
     location_name: str = Field(default="Selected Area")
+    start_points: Optional[List[Dict[str, float]]] = None
     # Flood parameters
-    rainfall_mm: Optional[float] = 150.0
-    duration_hours: Optional[float] = 24.0
-    sea_level_surge_m: Optional[float] = 0.0
+    rainfall_mm: Optional[float] = Field(default=150.0, ge=0, le=2500)
+    duration_hours: Optional[float] = Field(default=24.0, ge=0.25, le=168)
+    sea_level_surge_m: Optional[float] = Field(default=0.0, ge=0, le=15)
     # Earthquake parameters
-    magnitude: Optional[float] = 6.8
-    depth_km: Optional[float] = 10.0
+    magnitude: Optional[float] = Field(default=6.8, ge=4.0, le=9.5)
+    depth_km: Optional[float] = Field(default=10.0, ge=1.0, le=700.0)
     # Wildfire parameters
-    wind_speed_kmh: Optional[float] = 28.0
-    wind_direction_deg: Optional[float] = 45.0
-    temperature_c: Optional[float] = 34.0
-    relative_humidity_pct: Optional[float] = 22.0
+    wind_speed_kmh: Optional[float] = Field(default=28.0, ge=0, le=250)
+    wind_direction_deg: Optional[float] = Field(default=45.0, ge=0, le=360)
+    temperature_c: Optional[float] = Field(default=34.0, ge=0, le=60)
+    relative_humidity_pct: Optional[float] = Field(default=22.0, ge=1, le=100)
     # Landslide parameters
-    cumulative_rainfall_mm: Optional[float] = 200.0
+    cumulative_rainfall_mm: Optional[float] = Field(default=200.0, ge=0, le=2000)
     # Cyclone parameters
-    central_pressure_hpa: Optional[float] = 950.0
-    max_wind_kmh: Optional[float] = 165.0
+    central_pressure_hpa: Optional[float] = Field(default=950.0, ge=870, le=1010)
+    max_wind_kmh: Optional[float] = Field(default=165.0, ge=50, le=320)
 
 
 class GeodataRequest(BaseModel):
@@ -129,7 +215,16 @@ async def list_disasters():
 @app.get("/api/provenance")
 async def get_provenance(disaster_type: str = "flood"):
     """Retrieve explicit data provenance and model specifications."""
-    return get_provenance_summary(disaster_type)
+    summary = get_provenance_summary(disaster_type)
+    try:
+        from geodata.provenance import SYNTHETIC_DATA_NOTICE as _notice
+    except ImportError:
+        _notice = (
+            "Some inputs may be procedurally generated synthetic data when live "
+            "feeds are unreachable; treat affected layers as indicative, not observed."
+        )
+    summary["synthetic_data_notice"] = _notice
+    return summary
 
 
 @app.get("/api/scenarios/presets")
@@ -187,17 +282,18 @@ async def get_preset_scenarios():
 
 
 @app.post("/api/scenario/parse")
-async def parse_scenario(request: NaturalLanguageScenarioRequest):
+def parse_scenario(request: NaturalLanguageScenarioRequest):
     """Convert natural language query into strict validated simulation parameters."""
     try:
         result = parse_natural_language_scenario(request.prompt, request.current_disaster)
         return result
     except Exception as e:
+        logger.exception("Scenario parse failed")
         raise HTTPException(status_code=500, detail=f"Scenario parse error: {str(e)}")
 
 
 @app.post("/api/geodata")
-async def get_geodata_endpoint(request: GeodataRequest):
+def get_geodata_endpoint(request: GeodataRequest):
     """Fetch geospatial data (roads, buildings, facilities) from OSM or spatial cache."""
     try:
         t0 = time.time()
@@ -212,11 +308,12 @@ async def get_geodata_endpoint(request: GeodataRequest):
         session_cache["bbox"] = request.bbox.model_dump()
         return data
     except Exception as e:
+        logger.exception("Geodata fetch failed")
         raise HTTPException(status_code=500, detail=f"Failed to fetch geodata: {str(e)}")
 
 
 @app.post("/api/elevation")
-async def get_elevation_endpoint(request: GeodataRequest):
+def get_elevation_endpoint(request: GeodataRequest):
     """Fetch elevation grid, slope, and aspect."""
     try:
         t0 = time.time()
@@ -238,11 +335,12 @@ async def get_elevation_endpoint(request: GeodataRequest):
             "fetch_time_s": result["fetch_time_s"],
         }
     except Exception as e:
+        logger.exception("Elevation fetch failed")
         raise HTTPException(status_code=500, detail=f"Failed to fetch elevation: {str(e)}")
 
 
 @app.post("/api/simulate")
-async def run_simulation_endpoint(request: SimulationRequest):
+def run_simulation_endpoint(request: SimulationRequest):
     """
     Run full end-to-end multi-hazard simulation pipeline:
     1. Retrieve DEM & Topography
@@ -299,14 +397,17 @@ async def run_simulation_endpoint(request: SimulationRequest):
         scenario_params["aoi_bbox"] = aoi_bbox
         scenario_params["sim_bbox"] = sim_bbox
 
-        hazard_output = run_hazard_simulation(
-            disaster_type=disaster_type,
-            elevation=elevation,
-            geodata=geodata,
-            scenario=scenario_params,
-            resolution_m=elev_result["resolution_m"],
-            bbox=sim_bbox,
-        )
+        try:
+            hazard_output = run_hazard_simulation(
+                disaster_type=disaster_type,
+                elevation=elevation,
+                geodata=geodata,
+                scenario=scenario_params,
+                resolution_m=elev_result["resolution_m"],
+                bbox=sim_bbox,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
         timing["simulation_time_s"] = round(time.time() - t0, 2)
 
         # Step 4: Deterministic GIS Impact Analysis & Road Routing
@@ -318,12 +419,19 @@ async def run_simulation_endpoint(request: SimulationRequest):
             "disaster_type": disaster_type,
             "aoi_bbox": aoi_bbox,
         }
+        try:
+            _surge = (hazard_output.metadata or {}).get("surge_grid")
+        except Exception:
+            _surge = None
+        if _surge is not None:
+            sim_dict["surge_grid"] = _surge
         impact = analyze_impact(
             simulation_result=sim_dict,
             geodata=geodata,
             bbox=sim_bbox,
             grid_resolution=elev_result["resolution_m"],
             elevation=elevation,
+            start_points=request.start_points,
         )
         timing["analysis_time_s"] = round(time.time() - t0, 2)
 
@@ -350,7 +458,7 @@ async def run_simulation_endpoint(request: SimulationRequest):
             timing=timing,
         )
 
-        session_cache["last_run"] = {
+        session_cache["last_run"] = last_entry = {
             "run_uuid": run_uuid,
             "hazard_output": hazard_output,
             "impact": impact,
@@ -358,22 +466,73 @@ async def run_simulation_endpoint(request: SimulationRequest):
             "bbox": sim_bbox,
             "aoi_bbox": aoi_bbox,
         }
+        # Bounded per-scenario key: sha1(bbox + disaster_type + sorted params)
+        try:
+            _ckey = _scenario_cache_key(aoi_bbox, disaster_type, scenario_params)
+            session_cache[_ckey] = last_entry
+        except Exception:
+            logger.warning("Scenario cache-key store failed", exc_info=True)
+
+        # Synthetic-flag wiring (additive): surface data quality to clients
+        geo_synth = bool(geodata.get("is_synthetic", False))
+        elev_synth = bool(elev_result.get("is_synthetic", False))
+        if geo_synth and elev_synth:
+            data_quality = "synthetic"
+        elif geo_synth or elev_synth:
+            data_quality = "mixed"
+        else:
+            data_quality = "observed"
+        top_is_synthetic = bool(geo_synth or elev_synth or impact.get("is_synthetic", False))
+
+        # User-facing fetch warnings (additive): tell clients WHY fallback data
+        # is used so the UI can advise drawing a smaller area.
+        warnings: List[str] = []
+        if geo_synth:
+            _parts = geodata.get("synthetic_parts") or []
+            if _parts:
+                warnings.append(
+                    "Live map data partially failed (" + ", ".join(_parts) + " unavailable) — "
+                    "this area contains too many objects to fetch. Draw a smaller area for full real data."
+                )
+            else:
+                warnings.append(
+                    "Live map data (OpenStreetMap) timed out — this area contains too many "
+                    "objects to fetch. Please draw a smaller area and run again."
+                )
+        if elev_synth:
+            warnings.append(
+                "Elevation service was rate-limited or unreachable — using modeled terrain. "
+                "A smaller area reduces load; you can also retry in a minute."
+            )
 
         # Build response adhering strictly to frontend specifications
+        # (additive-only: existing keys preserved, new keys appended)
+        simulation_payload: Dict[str, Any] = {
+            "timesteps": hazard_output.timesteps,
+            "frames": hazard_output.frames,
+            "max_depth": hazard_output.max_hazard,
+            "max_hazard": hazard_output.max_hazard,
+            "rows": hazard_output.rows,
+            "cols": hazard_output.cols,
+            "total_time_hours": hazard_output.total_time_hours,
+            "disaster_type": disaster_type,
+            "hazard_unit": hazard_output.hazard_unit,
+            "model_name": hazard_output.model_name,
+        }
+        try:
+            _meta = hazard_output.metadata or {}
+            if _meta.get("surge_grid") is not None:
+                simulation_payload["surge_grid"] = _meta.get("surge_grid")
+            if _meta.get("max_surge_m") is not None:
+                simulation_payload["max_surge_m"] = _meta.get("max_surge_m")
+        except Exception:
+            logger.warning("Surge payload attach failed", exc_info=True)
         return {
             "run_uuid": run_uuid,
-            "simulation": {
-                "timesteps": hazard_output.timesteps,
-                "frames": hazard_output.frames,
-                "max_depth": hazard_output.max_hazard,
-                "max_hazard": hazard_output.max_hazard,
-                "rows": hazard_output.rows,
-                "cols": hazard_output.cols,
-                "total_time_hours": hazard_output.total_time_hours,
-                "disaster_type": disaster_type,
-                "hazard_unit": hazard_output.hazard_unit,
-                "model_name": hazard_output.model_name,
-            },
+            "is_synthetic": top_is_synthetic,
+            "data_quality": data_quality,
+            "warnings": warnings,
+            "simulation": simulation_payload,
             "impact": impact,
             "geodata": {
                 "roads": impact.get("roads", geodata.get("roads", [])),
@@ -404,17 +563,35 @@ async def run_simulation_endpoint(request: SimulationRequest):
             "provenance": get_provenance_summary(disaster_type),
         }
 
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
-        import traceback
-        traceback.print_exc()
+        logger.exception("Simulation failed")
         raise HTTPException(status_code=500, detail=f"Simulation failed: {str(e)}")
 
 
 @app.post("/api/evacuation-routes")
-async def get_evacuation_routes_endpoint(request: EvacuationRouteRequest):
+def get_evacuation_routes_endpoint(request: EvacuationRouteRequest):
     """Compute alternative safe evacuation routes on open road network."""
     try:
         bbox = request.bbox.model_dump()
+        cached_bbox = None
+        try:
+            cached_bbox = session_cache.get("bbox")
+        except Exception:
+            cached_bbox = None
+        if cached_bbox is not None and (
+            round(cached_bbox.get("south", 0), 5) != round(bbox.get("south", 0), 5)
+            or round(cached_bbox.get("west", 0), 5) != round(bbox.get("west", 0), 5)
+            or round(cached_bbox.get("north", 0), 5) != round(bbox.get("north", 0), 5)
+            or round(cached_bbox.get("east", 0), 5) != round(bbox.get("east", 0), 5)
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Cached scenario is for a different area — run /api/simulate for this bbox first",
+            )
         geodata = session_cache.get("geodata") or fetch_geodata(
             request.bbox.south, request.bbox.west, request.bbox.north, request.bbox.east
         )
@@ -428,12 +605,15 @@ async def get_evacuation_routes_endpoint(request: EvacuationRouteRequest):
             bbox=bbox,
         )
         return {"routes": routes}
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.exception("Routing calculation failed")
         raise HTTPException(status_code=500, detail=f"Routing calculation failed: {str(e)}")
 
 
 @app.post("/api/ai-insight")
-async def get_ai_insight_endpoint(request: AIInsightRequest):
+def get_ai_insight_endpoint(request: AIInsightRequest):
     """Generate or refresh AI insight for simulation results."""
     try:
         insight = generate_insight(
@@ -443,14 +623,35 @@ async def get_ai_insight_endpoint(request: AIInsightRequest):
         )
         return insight
     except Exception as e:
+        logger.exception("AI insight failed")
         raise HTTPException(status_code=500, detail=f"AI insight failed: {str(e)}")
 
 
+def _extract_impact(run_or_payload: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(run_or_payload, dict):
+        return None
+    if isinstance(run_or_payload.get("impact"), dict):
+        return run_or_payload["impact"]
+    # Accept a bare impact dict (inline scenario payload)
+    numeric_probe = ("flooded_area_km2", "affected_area_km2", "estimated_population_exposed",
+                     "buildings_affected", "road_status", "max_hazard", "peak_hazard_value")
+    if any(k in run_or_payload for k in numeric_probe):
+        return run_or_payload
+    return None
+
+
 @app.post("/api/compare")
-async def compare_simulations_endpoint(request: CompareRequest):
+def compare_simulations_endpoint(request: CompareRequest):
     """Compare two simulation runs or calculate metrics delta."""
     run_a = get_simulation_run(request.run_id_a) if request.run_id_a else None
     run_b = get_simulation_run(request.run_id_b) if request.run_id_b else None
+    # Honor inline scenario payloads if provided (additive; run IDs take precedence)
+    if run_a is None and request.scenario_a is not None:
+        imp = _extract_impact(request.scenario_a)
+        run_a = {"impact": imp, "scenario": request.scenario_a} if imp is not None else {"impact": {}, "scenario": request.scenario_a}
+    if run_b is None and request.scenario_b is not None:
+        imp = _extract_impact(request.scenario_b)
+        run_b = {"impact": imp, "scenario": request.scenario_b} if imp is not None else {"impact": {}, "scenario": request.scenario_b}
 
     if not run_a or not run_b:
         # Fallback comparison demo data if run IDs are missing
@@ -459,25 +660,57 @@ async def compare_simulations_endpoint(request: CompareRequest):
             "deltas": {},
         }
 
-    imp_a = run_a["impact"]
-    imp_b = run_b["impact"]
+    imp_a = run_a.get("impact", {}) or {}
+    imp_b = run_b.get("impact", {}) or {}
 
-    delta_area = imp_b.get("flooded_area_km2", 0) - imp_a.get("flooded_area_km2", 0)
+    delta_area = imp_b.get("flooded_area_km2", imp_b.get("affected_area_km2", 0)) - imp_a.get("flooded_area_km2", imp_a.get("affected_area_km2", 0))
     delta_pop = imp_b.get("estimated_population_exposed", 0) - imp_a.get("estimated_population_exposed", 0)
     delta_bld = imp_b.get("buildings_affected", 0) - imp_a.get("buildings_affected", 0)
     delta_roads_closed = (
-        imp_b.get("road_status", {}).get("closed", 0) - imp_a.get("road_status", {}).get("closed", 0)
+        (imp_b.get("road_status", {}) or {}).get("closed", 0) - (imp_a.get("road_status", {}) or {}).get("closed", 0)
     )
+
+    # Generic numeric deltas for whichever keys exist in both results
+    generic_keys = [
+        "flooded_area_km2", "affected_area_km2", "aoi_flooded_area_km2",
+        "outside_flooded_area_km2", "affected_population", "estimated_population_exposed",
+        "buildings_affected", "damaged_buildings", "closed_roads",
+        "critical_facilities_at_risk", "max_hazard", "max_surge_m",
+        "peak_hazard_value", "peak_flood_depth_m", "avg_flood_depth_m",
+        "total_buildings",
+    ]
+    for k in list(imp_a.keys()):
+        if k not in generic_keys and isinstance(imp_a.get(k), (int, float)) and isinstance(imp_b.get(k), (int, float)):
+            generic_keys.append(k)
+    deltas: Dict[str, Any] = {
+        "affected_area_km2": round(delta_area, 2),
+        "exposed_population": delta_pop,
+        "buildings_affected": delta_bld,
+        "roads_closed": delta_roads_closed,
+    }
+    for k in generic_keys:
+        va, vb = imp_a.get(k), imp_b.get(k)
+        if isinstance(va, (int, float)) and isinstance(vb, (int, float)) and k not in deltas:
+            try:
+                deltas[k] = round(vb - va, 2) if isinstance(vb - va, float) else vb - va
+            except Exception:
+                continue
+    # Nested road_status.closed delta under a generic alias too
+    try:
+        ra, rb = (imp_a.get("road_status", {}) or {}), (imp_b.get("road_status", {}) or {})
+        if isinstance(ra.get("closed"), (int, float)) and isinstance(rb.get("closed"), (int, float)):
+            deltas.setdefault("closed_roads", rb["closed"] - ra["closed"])
+    except Exception:
+        pass
 
     return {
         "run_a": run_a,
         "run_b": run_b,
-        "deltas": {
-            "affected_area_km2": round(delta_area, 2),
-            "exposed_population": delta_pop,
-            "buildings_affected": delta_bld,
-            "roads_closed": delta_roads_closed,
-        },
+        "deltas": deltas,
+        "comparison_summary": (
+            f"Scenario B vs A: Affected area changed by {delta_area:+.1f} km², "
+            f"exposing {delta_pop:+d} additional residents, with {delta_roads_closed:+d} road closure changes."
+        ),
         "summary": (
             f"Scenario B vs A: Affected area changed by {delta_area:+.1f} km², "
             f"exposing {delta_pop:+d} additional residents, with {delta_roads_closed:+d} road closure changes."
@@ -487,7 +720,7 @@ async def compare_simulations_endpoint(request: CompareRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    print("\n[*] DisasterLens API Server Starting...")
-    print(f"    Gemini API: {'[OK] Configured' if config.GEMINI_API_KEY else '[!] Offline mode (deterministic rule-based insights)'}")
-    print("    Starting on http://localhost:8000\n")
+    logger.info("\n[*] DisasterLens API Server Starting...")
+    logger.info("    Gemini API: %s", '[OK] Configured' if config.GEMINI_API_KEY else '[!] Offline mode (deterministic rule-based insights)')
+    logger.info("    Starting on http://localhost:8000\n")
     uvicorn.run(app, host="0.0.0.0", port=8000)

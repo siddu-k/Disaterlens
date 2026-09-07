@@ -8,7 +8,10 @@ geometries, 75 verified critical facilities, and 1,430 building footprints.
 
 import os
 import json
+import logging
 from typing import Dict, Any
+
+logger = logging.getLogger(__name__)
 
 MUMBAI_GS_WARD_BBOX = {
     "south": 18.9800,
@@ -79,7 +82,7 @@ def get_pre_cached_mumbai_geodata() -> Dict[str, Any]:
                 "dataset_name": "G/S Ward, Mumbai, Maharashtra (Authoritative Real OSM 2024)",
             }
         except Exception as e:
-            print(f"[Cached Scenarios] Error reading real OSM file: {e}")
+            logger.warning(f"[Cached Scenarios] Error reading real OSM file: {e}")
 
     # Baseline fallback
     return {

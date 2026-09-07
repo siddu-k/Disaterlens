@@ -7,8 +7,14 @@ and computes safe evacuation routes to reachable shelters and hospitals.
 """
 
 import math
+import logging
 from typing import Dict, Any, List, Tuple, Optional
 import networkx as nx
+
+logger = logging.getLogger(__name__)
+
+SNAP_TOLERANCE_M = 500.0
+_GRID_CELL_DEG = 0.01
 
 
 def build_road_network_graph(roads: List[Dict[str, Any]]) -> nx.Graph:
@@ -41,13 +47,15 @@ def build_road_network_graph(roads: List[Dict[str, Any]]) -> nx.Graph:
             p1 = (round(coords[i][1], 5), round(coords[i][0], 5))  # (lat, lon)
             p2 = (round(coords[i+1][1], 5), round(coords[i+1][0], 5))
 
+            # Closed edges are excluded from the graph entirely so no
+            # route can traverse them (cost<1e7 check below is belt-and-braces).
+            if status == "closed":
+                continue
             seg_len = _haversine(p1[0], p1[1], p2[0], p2[1])
             time_s = seg_len / speed_ms
 
-            # Impedance weight: closed roads have prohibitive cost
-            if status == "closed":
-                weight = 1e9
-            elif status == "restricted":
+            # Impedance weight accounting for restricted-road delays
+            if status == "restricted":
                 weight = time_s * 3.5
             else:
                 weight = time_s
@@ -70,11 +78,29 @@ def compute_evacuation_routes(
     facilities: List[Dict[str, Any]],
     start_points: Optional[List[Dict[str, float]]] = None,
     bbox: Optional[Dict[str, float]] = None,
+    disaster_type: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Compute optimal safe evacuation paths from affected areas to reachable shelters.
     Avoids closed roads and accounts for restricted road delays.
+    When disaster_type == 'wildfire', first attempts routes using only 'open'
+    roads (smoke-restricted segments treated as impassable); falls back to the
+    standard open+restricted network when that yields zero routes.
     """
+    if disaster_type == "wildfire":
+        open_only = [r for r in (roads or []) if r.get("status", "open") == "open"]
+        routes = _compute_routes_on_network(open_only, facilities, start_points, bbox)
+        if routes:
+            return routes
+    return _compute_routes_on_network(roads, facilities, start_points, bbox)
+
+
+def _compute_routes_on_network(
+    roads: List[Dict[str, Any]],
+    facilities: List[Dict[str, Any]],
+    start_points: Optional[List[Dict[str, float]]] = None,
+    bbox: Optional[Dict[str, float]] = None,
+) -> List[Dict[str, Any]]:
     G = build_road_network_graph(roads)
     if len(G.nodes) == 0:
         return []
@@ -95,18 +121,25 @@ def compute_evacuation_routes(
 
     routes = []
     node_list = list(G.nodes)
+    grid_index = _build_grid_index(node_list)
 
     for sp in (start_points or []):
-        start_node = _find_nearest_node(sp["lat"], sp["lon"], node_list)
+        start_node = _find_nearest_node(sp["lat"], sp["lon"], node_list, grid_index)
         if not start_node:
+            continue
+        if _haversine(sp["lat"], sp["lon"], start_node[0], start_node[1]) > SNAP_TOLERANCE_M:
+            logger.info("Skipping start point %s: nearest node >500m away", sp.get("label", sp))
             continue
 
         best_route = None
         min_cost = float("inf")
 
         for target in safe_targets:
-            target_node = _find_nearest_node(target["lat"], target["lon"], node_list)
+            target_node = _find_nearest_node(target["lat"], target["lon"], node_list, grid_index)
             if not target_node or target_node == start_node:
+                continue
+            if _haversine(target["lat"], target["lon"], target_node[0], target_node[1]) > SNAP_TOLERANCE_M:
+                logger.info("Skipping target %s: nearest node >500m away", target.get("name", "?"))
                 continue
 
             try:
@@ -152,13 +185,38 @@ def compute_evacuation_routes(
     return routes
 
 
-def _find_nearest_node(lat: float, lon: float, nodes: List[Tuple[float, float]]) -> Optional[Tuple[float, float]]:
-    """Find closest graph vertex to query coordinate."""
+def _build_grid_index(nodes: List[Tuple[float, float]]) -> Dict[Tuple[int, int], List[Tuple[float, float]]]:
+    """Bucket graph vertices into ~0.01° cells for fast nearest lookup."""
+    index: Dict[Tuple[int, int], List[Tuple[float, float]]] = {}
+    for n in nodes:
+        key = (int(math.floor(n[0] / _GRID_CELL_DEG)), int(math.floor(n[1] / _GRID_CELL_DEG)))
+        index.setdefault(key, []).append(n)
+    return index
+
+
+def _find_nearest_node(lat: float, lon: float, nodes: List[Tuple[float, float]], grid_index: Optional[Dict] = None) -> Optional[Tuple[float, float]]:
+    """Find closest graph vertex to query coordinate via grid index."""
     if not nodes:
         return None
+    candidates: Optional[List[Tuple[float, float]]] = None
+    if grid_index:
+        cx, cy = int(math.floor(lat / _GRID_CELL_DEG)), int(math.floor(lon / _GRID_CELL_DEG))
+        # Expand search rings until candidates found (up to ~5 cells ≈ 5km)
+        for ring in range(0, 6):
+            found: List[Tuple[float, float]] = []
+            for dx in range(-ring, ring + 1):
+                for dy in range(-ring, ring + 1):
+                    if ring and max(abs(dx), abs(dy)) != ring:
+                        continue
+                    found.extend(grid_index.get((cx + dx, cy + dy), []))
+            if found:
+                candidates = found
+                break
+    if candidates is None:
+        candidates = nodes
     best = None
     min_dist = float("inf")
-    for n in nodes:
+    for n in candidates:
         d = (n[0] - lat)**2 + (n[1] - lon)**2
         if d < min_dist:
             min_dist = d

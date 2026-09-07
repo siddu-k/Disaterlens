@@ -9,9 +9,12 @@ wildfire propagation models.
 import numpy as np
 import requests
 import math
+import logging
 from typing import Dict, Any, Tuple
 import config
 from db.spatial_store import get_cached_elevation, save_cached_elevation
+
+logger = logging.getLogger(__name__)
 
 
 def fetch_elevation_grid(
@@ -25,15 +28,6 @@ def fetch_elevation_grid(
     Fetch elevation data as a 2D grid for a bounding box with slope and aspect.
     Checks spatial cache first for instant response.
     """
-    # 1. Check cache
-    cached = get_cached_elevation(south, west, north, east)
-    if cached is not None:
-        elev = cached["elevation"]
-        slope_deg, aspect_deg = calculate_slope_and_aspect(elev, cached["resolution_m"])
-        cached["slope_deg"] = slope_deg
-        cached["aspect_deg"] = aspect_deg
-        return cached
-
     max_grid_size = 25
     center_lat = (south + north) / 2.0
     lat_span = max(abs(north - south), 0.001)
@@ -45,6 +39,17 @@ def fetch_elevation_grid(
     raw_cols = max(10, int(lon_span / (resolution_m / (111320.0 * cos_lat))))
     rows = min(max_grid_size, raw_rows)
     cols = min(max_grid_size, raw_cols)
+
+    # 1. Check cache (resolution-aware so different resolutions don't collide)
+    cached = get_cached_elevation(south, west, north, east, resolution_m=resolution_m, rows=rows, cols=cols)
+    if cached is not None:
+        elev = cached["elevation"]
+        slope_deg, aspect_deg = calculate_slope_and_aspect(elev, cached["resolution_m"])
+        cached["slope_deg"] = slope_deg
+        cached["aspect_deg"] = aspect_deg
+        if "is_synthetic" not in cached:
+            cached["is_synthetic"] = False
+        return cached
 
     lats = [round(float(v), 6) for v in np.linspace(north, south, rows)]
     lons = [round(float(v), 6) for v in np.linspace(west, east, cols)]
@@ -68,7 +73,7 @@ def fetch_elevation_grid(
                 timeout=3,
             )
             if response.status_code == 429:
-                print(f"[Elevation] Open-Meteo 429 rate limit reached. Using synthetic terrain.")
+                logger.warning(f"[Elevation] Open-Meteo 429 rate limit reached. Using synthetic terrain.")
                 api_failed = True
                 break
             response.raise_for_status()
@@ -76,17 +81,19 @@ def fetch_elevation_grid(
             elevations = data.get("elevation", [])
             all_elevations.extend(elevations)
         except Exception as e:
-            print(f"[Elevation] Notice: {e}. Falling back to deterministic terrain.")
+            logger.warning(f"[Elevation] Notice: {e}. Falling back to deterministic terrain.")
             api_failed = True
             break
 
     if api_failed or len(all_elevations) != total_points:
         # Fallback terrain generation (deterministic gradient based on latitude/longitude)
-        print("[Elevation] Generating deterministic terrain from bounding coordinates")
+        logger.info("[Elevation] Generating deterministic terrain from bounding coordinates")
         elevation_grid = _generate_synthetic_terrain(rows, cols, south, north, west, east)
+        is_synthetic = True
     else:
         elevation_grid = np.array(all_elevations, dtype=np.float64).reshape(rows, cols)
         _fill_nan_neighbors(elevation_grid)
+        is_synthetic = False
 
     slope_deg, aspect_deg = calculate_slope_and_aspect(elevation_grid, resolution_m)
     
@@ -99,13 +106,14 @@ def fetch_elevation_grid(
         "lats": lats,
         "lons": lons,
         "resolution_m": resolution_m,
+        "is_synthetic": is_synthetic,
     }
     
     # Save to spatial cache
     try:
         save_cached_elevation(south, west, north, east, result)
     except Exception as e:
-        print(f"[Elevation Cache] Warning: {e}")
+        logger.warning(f"[Elevation Cache] Warning: {e}")
         
     return result
 

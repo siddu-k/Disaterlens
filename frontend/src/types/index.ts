@@ -67,6 +67,9 @@ export interface BuildingFeature {
   flooded: boolean;
   flood_depth: number;
   hazard_severity?: number;
+  damage_state?: string;
+  damage_ratio?: number;
+  affected?: boolean;
   levels?: number;
   height_m?: number;
   elevation_m?: number;
@@ -86,6 +89,10 @@ export interface Facility {
   lon: number;
   flooded: boolean;
   flood_depth: number;
+  hazard_severity?: number;
+  at_risk?: boolean;
+  functionality?: string;
+  smoke_risk?: boolean;
   elevation_m?: number;
   distance_km?: number;
   capacity?: number;
@@ -203,9 +210,22 @@ export interface SimulationResult {
     total_buildings: number;
     road_status: RoadStatus;
     critical_facilities_at_risk: number;
+    estimated_fatalities?: number;
+    estimated_injuries?: number;
+    estimated_displaced?: number;
+    population_smoke_exposed?: number;
+    population_at_risk?: number;
+    buildings_summary?: {
+      total: number;
+      affected: number;
+      safe: number;
+      buildings_destroyed?: number;
+    };
     facilities: Facility[];
     safe_facilities: Facility[];
     evacuation_routes: EvacuationRoute[];
+    roads?: RoadFeature[];
+    buildings?: BuildingFeature[];
     aoi_flooded_area_km2?: number;
     outside_flooded_area_km2?: number;
     discharged_outside_m3?: number;
@@ -218,6 +238,8 @@ export interface SimulationResult {
     hospitals?: Facility[];
     shelters?: Facility[];
     stats: Record<string, number>;
+    is_synthetic?: boolean;
+    data_quality?: string;
   };
   evacuation_routes: EvacuationRoute[];
   ai_insight: AIInsight;
@@ -234,6 +256,9 @@ export interface SimulationResult {
   };
   bbox: BoundingBox;
   aoi_bbox?: BoundingBox;
+  is_synthetic?: boolean;
+  data_quality?: string;
+  warnings?: string[];
   timing: Record<string, number>;
   scenario: Record<string, any>;
   provenance: ProvenanceResponse;

@@ -6,7 +6,7 @@ and hazard model used in DisasterLens.
 """
 
 from typing import List, Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
 
 DATA_SOURCES: List[Dict[str, Any]] = [
     {
@@ -156,12 +156,19 @@ DISCLAIMER_NOTICE = (
     "operations should coordinate with local disaster management authorities (e.g. NDMA/FEMA)."
 )
 
+SYNTHETIC_DATA_NOTICE: str = (
+    "Some geospatial or terrain values in this response may be deterministic synthetic fallback "
+    "data generated locally when live upstream sources (OpenStreetMap Overpass, Copernicus DEM) "
+    "were unreachable; such payloads are flagged with is_synthetic=true and source='synthetic'. "
+    "Verify against authoritative sources before any critical operational use."
+)
+
 
 def get_provenance_summary(disaster_type: str = "flood") -> Dict[str, Any]:
     """Return complete provenance record for UI display and judge inspection."""
     return {
         "data_sources": DATA_SOURCES,
         "disaster_model": MODEL_PROVENANCE.get(disaster_type, MODEL_PROVENANCE["flood"]),
-        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "disclaimer": DISCLAIMER_NOTICE,
     }
