@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, lazy, Suspense } from 'react';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
-import { BoundingBox, SimulationResult, RoadFeature, Facility, BuildingFeature, EvacuationRoute } from '../types';
+import { BoundingBox, SimulationResult, RoadFeature, Facility, BuildingFeature, EvacuationRoute, SatDetection, SatChange } from '../types';
 import {
   IconFlood,
   IconCyclone,
@@ -127,6 +127,11 @@ interface MapViewProps {
   onIgnitionSelect?: (lat: number, lon: number) => void;
   isPickingIgnition?: boolean;
   setIsPickingIgnition?: (val: boolean) => void;
+  satDetections?: SatDetection[] | null;
+  satChanges?: SatChange[] | null;
+  satLayersVisible?: boolean;
+  satCompareMix?: number;
+  focusedPoint?: { lat: number; lon: number; nonce: number } | null;
 }
 
 const TILE_URLS = {
@@ -436,6 +441,11 @@ export default function MapView({
   onIgnitionSelect,
   isPickingIgnition = false,
   setIsPickingIgnition,
+  satDetections = null,
+  satChanges = null,
+  satLayersVisible = true,
+  satCompareMix = 0.5,
+  focusedPoint = null,
 }: MapViewProps) {
   const hz = hazardDisplay(disasterType);
   const mapContainerRef = useRef<HTMLDivElement>(null);
@@ -448,6 +458,8 @@ export default function MapView({
   const routesLayerRef = useRef<L.LayerGroup | null>(null);
   const cycloneTrackLayerRef = useRef<L.LayerGroup | null>(null);
   const wildfireOverlayLayerRef = useRef<L.LayerGroup | null>(null);
+  const satDetectionsLayerRef = useRef<L.LayerGroup | null>(null);
+  const satChangesLayerRef = useRef<L.LayerGroup | null>(null);
   const bboxRectRef = useRef<L.Rectangle | null>(null);
   const lastRunUuidRef = useRef<string>('');
   const landmarksLayerRef = useRef<L.LayerGroup | null>(null);
@@ -561,6 +573,8 @@ export default function MapView({
     routesLayerRef.current = L.layerGroup().addTo(map);
     cycloneTrackLayerRef.current = L.layerGroup().addTo(map);
     wildfireOverlayLayerRef.current = L.layerGroup().addTo(map);
+    satDetectionsLayerRef.current = L.layerGroup().addTo(map);
+    satChangesLayerRef.current = L.layerGroup().addTo(map);
     landmarksLayerRef.current = L.layerGroup().addTo(map);
 
     // Track camera (zoom + pan) so vectors render only for the visible viewport.
@@ -687,6 +701,75 @@ export default function MapView({
     setSelectedRoad(null);
     mapRef.current.flyTo([fac.lat, fac.lon], Math.max(mapRef.current.getZoom(), 15), { duration: 0.8 });
   }, [focusedFacility]);
+
+  // Generic satellite-detection click-to-locate: fly to the point (no inspector).
+  useEffect(() => {
+    if (!focusedPoint || !mapRef.current) return;
+    if (typeof focusedPoint.lat !== 'number' || typeof focusedPoint.lon !== 'number') return;
+    mapRef.current.flyTo([focusedPoint.lat, focusedPoint.lon], Math.max(mapRef.current.getZoom(), 15), { duration: 0.8 });
+  }, [focusedPoint]);
+
+  // Satellite computer-vision overlays: detections + before/after changes.
+  useEffect(() => {
+    if (!mapRef.current || !satDetectionsLayerRef.current || !satChangesLayerRef.current) return;
+    satDetectionsLayerRef.current.clearLayers();
+    satChangesLayerRef.current.clearLayers();
+    if (!satLayersVisible) return;
+
+    const detColor = (t: string): string => {
+      const v = (t || '').toLowerCase();
+      if (v === 'building') return '#38bdf8';
+      if (v === 'road') return '#34d399';
+      if (v === 'water') return '#60a5fa';
+      if (v === 'tree') return '#4ade80';
+      if (v === 'solar') return '#facc15';
+      return '#38bdf8';
+    };
+    const changeColor = (c: string): string => {
+      if (c === 'added') return '#22c55e';
+      if (c === 'removed') return '#ef4444';
+      return '#f59e0b';
+    };
+
+    const compareActive = !!satChanges && satChanges.length > 0;
+    const detOpacity = compareActive ? 1 - Math.min(Math.max(satCompareMix ?? 0.5, 0), 1) : 1;
+
+    (satDetections || []).slice(0, 1000).forEach((d) => {
+      if (typeof d.lat !== 'number' || typeof d.lon !== 'number') return;
+      const color = detColor(String(d.type));
+      L.circleMarker([d.lat, d.lon], {
+        radius: 4,
+        color,
+        fillColor: color,
+        fillOpacity: Math.max(0.15, 0.85 * detOpacity),
+        opacity: Math.max(0.15, detOpacity),
+        weight: 1.2,
+      })
+        .addTo(satDetectionsLayerRef.current!)
+        .bindTooltip(
+          `<strong>${escapeHtml(String(d.type))}</strong><br/><span style="font-size:10px;color:#94a3b8;">conf ${(Number(d.confidence) * 100).toFixed(0)}%${d.area_sqm != null ? ` • ${Math.round(Number(d.area_sqm))} m²` : ''}</span>`,
+          { sticky: true, className: 'custom-map-tooltip' }
+        );
+    });
+
+    (satChanges || []).slice(0, 500).forEach((c) => {
+      if (typeof c.lat !== 'number' || typeof c.lon !== 'number') return;
+      const color = changeColor(String(c.change));
+      L.circleMarker([c.lat, c.lon], {
+        radius: 5,
+        color,
+        fillColor: color,
+        fillOpacity: 0.85,
+        opacity: 1,
+        weight: 1.5,
+      })
+        .addTo(satChangesLayerRef.current!)
+        .bindTooltip(
+          `<strong>${escapeHtml(String(c.change))} • ${escapeHtml(String(c.type))}</strong>`,
+          { sticky: true, className: 'custom-map-tooltip' }
+        );
+    });
+  }, [satDetections, satChanges, satLayersVisible, satCompareMix]);
 
   // Sync AOI Rectangle
   useEffect(() => {

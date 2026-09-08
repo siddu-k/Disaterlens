@@ -292,3 +292,62 @@ export interface ScenarioPreset {
   parameters: Record<string, any>;
   description: string;
 }
+
+// ─── Satellite Computer Vision (satvision) ─────────────────────
+export type SatObjectType = 'building' | 'road' | 'water' | 'tree' | 'solar';
+
+export interface SatDetection {
+  id: string | number;
+  type: SatObjectType | string;
+  lat: number;
+  lon: number;
+  area_sqm?: number | null;
+  confidence: number;
+  source?: string;
+}
+
+export interface SatStats {
+  total: number;
+  by_type: Record<string, number>;
+  area_covered_sqm: number;
+  mean_confidence: number;
+}
+
+export interface SatDetectResponse {
+  snapshot_id: string;
+  timestamp: string;
+  detections: SatDetection[];
+  stats: SatStats;
+  is_synthetic: boolean;
+  not_available_types: string[];
+}
+
+export interface SatSnapshot {
+  id: string;
+  created_at: string;
+  bbox: BoundingBox;
+}
+
+export interface SatChange {
+  change: 'added' | 'removed' | 'modified';
+  type: SatObjectType | string;
+  lat: number;
+  lon: number;
+  id: string | number;
+}
+
+export interface SatCompareSummary {
+  new_buildings: number;
+  removed_buildings: number;
+  new_total: number;
+  removed_total: number;
+  vegetation_change_pct: number;
+  water_change_pct: number;
+  built_up_change_pct: number;
+  total_changes: number;
+}
+
+export interface SatCompareResult {
+  summary: SatCompareSummary;
+  changes: SatChange[];
+}

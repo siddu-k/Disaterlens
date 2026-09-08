@@ -34,6 +34,12 @@ from analysis.impact import analyze_impact
 from analysis.routing import compute_evacuation_routes
 from ai.gemini import generate_insight, parse_natural_language_scenario
 from db.spatial_store import record_simulation_run, get_simulation_run
+from db.spatial_store import (
+    save_satvision_snapshot,
+    list_satvision_snapshots,
+    get_satvision_snapshot,
+)
+from satvision import detect_objects, compare_snapshots
 
 app = FastAPI(
     title="DisasterLens API",
@@ -246,6 +252,16 @@ class CompareRequest(BaseModel):
 
 class SetAiKeyRequest(BaseModel):
     api_key: str = Field(default="", description="Google Gemini API key")
+
+
+class SatvisionDetectRequest(BaseModel):
+    bbox: BoundingBox
+    object_types: List[str] = Field(default=["building", "road"])
+
+
+class SatvisionCompareRequest(BaseModel):
+    snapshot_id_a: str
+    snapshot_id_b: str
 
 
 # ─── API Endpoints ────────────────────────────────────────────────
@@ -859,6 +875,66 @@ def compare_simulations_endpoint(request: CompareRequest):
             f"Scenario B vs A: Affected area changed by {delta_area:+.1f} km², "
             f"exposing {delta_pop:+d} additional residents, with {delta_roads_closed:+d} road closure changes."
         ),
+    }
+
+
+@app.post("/api/satvision/detect")
+def satvision_detect_endpoint(request: SatvisionDetectRequest):
+    """Detect objects (OSM-vector proxy) and auto-save a detection snapshot."""
+    try:
+        result = detect_objects(request.bbox.model_dump(), request.object_types)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.exception("SatVision detection failed")
+        raise HTTPException(status_code=500, detail=f"SatVision detection failed: {str(e)}")
+    snapshot_id = uuid.uuid4().hex
+    try:
+        save_satvision_snapshot(snapshot_id, request.bbox.model_dump(), result)
+    except Exception as e:
+        logger.warning(f"SatVision snapshot save failed (best-effort): {e}")
+    return {
+        "snapshot_id": snapshot_id,
+        "timestamp": result.get("timestamp"),
+        "detections": (result.get("detections") or [])[:500],
+        "stats": result.get("stats", {}),
+        "is_synthetic": result.get("is_synthetic", False),
+        "not_available_types": result.get("not_available_types", []),
+    }
+
+
+@app.get("/api/satvision/snapshots")
+def satvision_list_snapshots_endpoint(
+    south: Optional[float] = None,
+    west: Optional[float] = None,
+    north: Optional[float] = None,
+    east: Optional[float] = None,
+):
+    """List latest detection snapshots; filter by bbox when all coords given."""
+    bbox = None
+    if south is not None and west is not None and north is not None and east is not None:
+        bbox = {"south": south, "west": west, "north": north, "east": east}
+    try:
+        snapshots = list_satvision_snapshots(bbox)
+    except Exception as e:
+        logger.exception("SatVision snapshot list failed")
+        raise HTTPException(status_code=500, detail=f"SatVision snapshot list failed: {str(e)}")
+    return {"snapshots": snapshots}
+
+
+@app.post("/api/satvision/compare")
+def satvision_compare_endpoint(request: SatvisionCompareRequest):
+    """Compare two detection snapshots by id."""
+    snap_a = get_satvision_snapshot(request.snapshot_id_a)
+    if snap_a is None:
+        raise HTTPException(status_code=404, detail=f"Snapshot not found: {request.snapshot_id_a}")
+    snap_b = get_satvision_snapshot(request.snapshot_id_b)
+    if snap_b is None:
+        raise HTTPException(status_code=404, detail=f"Snapshot not found: {request.snapshot_id_b}")
+    result = compare_snapshots(snap_a, snap_b)
+    return {
+        "summary": result.get("summary", {}),
+        "changes": (result.get("changes") or [])[:500],
     }
 
 

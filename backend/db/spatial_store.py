@@ -93,6 +93,16 @@ def _init_sqlite_db():
             )
         """)
 
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS satvision_snapshots (
+                id TEXT PRIMARY KEY,
+                created_at TEXT,
+                bbox_hash TEXT,
+                bbox_json TEXT,
+                payload_json TEXT
+            )
+        """)
+
         _ensure_created_at_columns(conn)
 
         conn.commit()
@@ -303,3 +313,107 @@ def get_simulation_run(run_uuid: str) -> Optional[Dict[str, Any]]:
             "created_at": row[5],
         }
     return None
+
+
+def _ensure_satvision_table(conn: sqlite3.Connection) -> None:
+    """Guarded DDL for the satellite-vision snapshot table (additive)."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS satvision_snapshots (
+            id TEXT PRIMARY KEY,
+            created_at TEXT,
+            bbox_hash TEXT,
+            bbox_json TEXT,
+            payload_json TEXT
+        )
+    """)
+
+
+def save_satvision_snapshot(snapshot_id: str, bbox: Dict[str, Any], payload: Dict[str, Any]) -> None:
+    """Persist a satellite-vision detection snapshot."""
+    import datetime as _dt
+    h = get_bbox_hash(
+        float(bbox["south"]), float(bbox["west"]),
+        float(bbox["north"]), float(bbox["east"]),
+    )
+    conn = _connect()
+    try:
+        _ensure_satvision_table(conn)
+        conn.execute(
+            "INSERT OR REPLACE INTO satvision_snapshots (id, created_at, bbox_hash, bbox_json, payload_json)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (
+                snapshot_id,
+                _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                h,
+                json.dumps(bbox),
+                json.dumps(payload),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_satvision_snapshots(bbox: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """List snapshots (latest 20); filter by bbox_hash when a bbox is given."""
+    conn = _connect()
+    try:
+        _ensure_satvision_table(conn)
+        cur = conn.cursor()
+        if bbox is not None:
+            h = get_bbox_hash(
+                float(bbox["south"]), float(bbox["west"]),
+                float(bbox["north"]), float(bbox["east"]),
+            )
+            cur.execute(
+                "SELECT id, created_at, bbox_json FROM satvision_snapshots"
+                " WHERE bbox_hash = ? ORDER BY created_at DESC LIMIT 20",
+                (h,),
+            )
+        else:
+            cur.execute(
+                "SELECT id, created_at, bbox_json FROM satvision_snapshots"
+                " ORDER BY created_at DESC LIMIT 20"
+            )
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        try:
+            parsed_bbox = json.loads(row[2]) if row[2] else None
+        except Exception:
+            parsed_bbox = None
+        out.append({"id": row[0], "created_at": row[1], "bbox": parsed_bbox})
+    return out
+
+
+def get_satvision_snapshot(snapshot_id: str) -> Optional[Dict[str, Any]]:
+    """Fetch a satellite-vision snapshot payload by id (None when missing)."""
+    conn = _connect()
+    try:
+        _ensure_satvision_table(conn)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, created_at, bbox_json, payload_json FROM satvision_snapshots WHERE id = ?",
+            (snapshot_id,),
+        )
+        row = cur.fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    try:
+        payload = json.loads(row[3]) if row[3] else {}
+    except Exception:
+        payload = {}
+    try:
+        bbox = json.loads(row[2]) if row[2] else None
+    except Exception:
+        bbox = None
+    result: Dict[str, Any] = {"id": row[0], "created_at": row[1], "bbox": bbox}
+    if isinstance(payload, dict):
+        result.update(payload)
+    else:
+        result["payload"] = payload
+    return result

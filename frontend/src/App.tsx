@@ -8,6 +8,8 @@ import {
   RoadFeature,
   Facility,
   ProvenanceResponse,
+  SatDetection,
+  SatChange,
 } from './types';
 import {
   runSimulation,
@@ -21,7 +23,10 @@ import {
   saveAiKey,
 } from './services/api';
 import MapView from './components/MapView';
+import LandingPage from './components/LandingPage';
 import ErrorBoundary from './components/ErrorBoundary';
+import ResearchCard from './components/ResearchCard';
+import SatVisionPage from './components/SatVisionPage';
 import {
   IconLocationPin,
   IconSearch,
@@ -64,6 +69,7 @@ import {
   IconPencil,
   IconReset,
   IconFlame,
+  IconSatellite,
 } from './components/Icons';
 
 // ─── Run History persistence (localStorage, quota-safe) ─────────────
@@ -234,6 +240,14 @@ function App() {
   const [showAllFacilities, setShowAllFacilities] = useState(false);
   const [warningsDismissedForRun, setWarningsDismissedForRun] = useState<string | null>(null);
   const [settingsPageOpen, setSettingsPageOpen] = useState(false);
+  // Landing page gate: first visit lands on the overview, then enters the app.
+  const [entered, setEntered] = useState<boolean>(() => {
+    try {
+      return sessionStorage.getItem('disasterlens-entered') === '1';
+    } catch {
+      return false;
+    }
+  });
   const [buildingDensity, setBuildingDensity] = useState<'medium' | 'maximum'>(() => {
     try {
       return localStorage.getItem('disasterlens-building-density') === 'maximum' ? 'maximum' : 'medium';
@@ -242,6 +256,15 @@ function App() {
     }
   });
   const [showEvacuationRoutes, setShowEvacuationRoutes] = useState(false);
+
+  // Satellite computer-vision shared state (SatVisionPanel <-> MapView)
+  const [satDetections, setSatDetections] = useState<SatDetection[] | null>(null);
+  const [satChanges, setSatChanges] = useState<SatChange[] | null>(null);
+  const [satLayersVisible, setSatLayersVisible] = useState<boolean>(true);
+  const [satCompareMix, setSatCompareMix] = useState<number>(0.5);
+  const [focusedPoint, setFocusedPoint] = useState<{ lat: number; lon: number; nonce: number } | null>(null);
+  const [satVisionPageOpen, setSatVisionPageOpen] = useState(false);
+  const [researchOpen, setResearchOpen] = useState(false);
 
   // Drawers & Modals
   const [showScenarioModal, setShowScenarioModal] = useState(false);
@@ -873,6 +896,19 @@ function App() {
     return { icon: <IconHospital size={15} color="#f87171" />, bg: 'rgba(239, 68, 68, 0.25)', color: '#f87171' };
   };
 
+  if (!entered) {
+    return (
+      <LandingPage
+        onLaunch={() => {
+          try {
+            sessionStorage.setItem('disasterlens-entered', '1');
+          } catch {}
+          setEntered(true);
+        }}
+      />
+    );
+  }
+
   return (
     <div
       className={`app-root-layout ${isResizingRight || isResizingLeft ? 'layout-resizing-active' : ''}`}
@@ -938,6 +974,27 @@ function App() {
                 </svg>
               </span>
               <span>Settings</span>
+            </button>
+            <button
+              className="sidebar-nav-btn"
+              onClick={() => setSatVisionPageOpen(true)}
+            >
+              <span className="sidebar-nav-icon">
+                <IconSatellite size={18} />
+              </span>
+              <span>Satellite Vision</span>
+            </button>
+            <button
+              className="sidebar-nav-btn"
+              onClick={() => {
+                setResearchOpen(true);
+                setTimeout(() => document.getElementById('research-card')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 60);
+              }}
+            >
+              <span className="sidebar-nav-icon">
+                <IconLightbulb size={18} />
+              </span>
+              <span>Research</span>
             </button>
           </nav>
         </div>
@@ -1089,6 +1146,11 @@ function App() {
                 }}
                 isPickingIgnition={isPickingIgnition}
                 setIsPickingIgnition={setIsPickingIgnition}
+                satDetections={null}
+                satChanges={null}
+                satLayersVisible={satLayersVisible}
+                satCompareMix={satCompareMix}
+                focusedPoint={focusedPoint}
               />
             </ErrorBoundary>
 
@@ -2437,6 +2499,9 @@ function App() {
                 )}
               </div>
             </div>
+
+            {/* Card 6: Research (placeholder) */}
+            <ResearchCard open={researchOpen} setOpen={setResearchOpen} />
           </aside>
           </ErrorBoundary>
         </main>
@@ -2539,6 +2604,25 @@ function App() {
             </div>
           </div>
         </div>
+      )}
+
+      {/* ─── Satellite Vision Page (separate full view, opened from sidebar) ─── */}
+      {satVisionPageOpen && (
+        <SatVisionPage
+          bbox={bbox}
+          setBbox={setBbox}
+          satDetections={satDetections}
+          setSatDetections={setSatDetections}
+          satChanges={satChanges}
+          setSatChanges={setSatChanges}
+          satLayersVisible={satLayersVisible}
+          setSatLayersVisible={setSatLayersVisible}
+          satCompareMix={satCompareMix}
+          setSatCompareMix={setSatCompareMix}
+          focusedPoint={focusedPoint}
+          setFocusedPoint={setFocusedPoint}
+          onBack={() => setSatVisionPageOpen(false)}
+        />
       )}
 
       {/* ─── Settings Page (full view, opened from sidebar) ─── */}

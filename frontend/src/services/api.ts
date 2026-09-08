@@ -1,6 +1,6 @@
 // DisasterLens — API Service Layer
 
-import { SimulationRequest, SimulationResult, ProvenanceResponse, ScenarioPreset } from '../types';
+import { SimulationRequest, SimulationResult, ProvenanceResponse, ScenarioPreset, BoundingBox, SatDetection, SatStats, SatSnapshot, SatCompareResult } from '../types';
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? '/api';
 
@@ -195,4 +195,44 @@ export async function saveAiKey(apiKey: string): Promise<{ status: string; confi
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ api_key: apiKey }),
   });
+}
+
+// ─── Satellite Computer Vision ─────────────────────────────────
+export interface SatDetectResult {
+  snapshot_id: string;
+  timestamp: string;
+  detections: SatDetection[];
+  stats: SatStats;
+  is_synthetic: boolean;
+  not_available_types: string[];
+}
+
+export async function detectObjects(bbox: BoundingBox, object_types: string[]): Promise<SatDetectResult> {
+  return fetchJson<SatDetectResult>(
+    `${API_BASE}/satvision/detect`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bbox, object_types }),
+    }
+  );
+}
+
+export async function listSnapshots(bbox: BoundingBox | null): Promise<SatSnapshot[]> {
+  const qs = bbox
+    ? `?south=${bbox.south}&west=${bbox.west}&north=${bbox.north}&east=${bbox.east}`
+    : '';
+  const data = await fetchJson<{ snapshots?: SatSnapshot[] }>(`${API_BASE}/satvision/snapshots${qs}`);
+  return data.snapshots || [];
+}
+
+export async function compareSnapshots(snapshot_id_a: string, snapshot_id_b: string): Promise<SatCompareResult> {
+  return fetchJson<SatCompareResult>(
+    `${API_BASE}/satvision/compare`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ snapshot_id_a, snapshot_id_b }),
+    }
+  );
 }
