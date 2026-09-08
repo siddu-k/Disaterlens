@@ -454,10 +454,6 @@ export default function MapView({
   const hazardDataUrlCacheRef = useRef<Map<number, string>>(new Map());
   // Tracks which run_uuid the vector camera fit already ran for (skip refit on frame scrub).
   const vectorFitDoneForRunRef = useRef<string>('');
-  // Playback freeze guard: while the timeline plays, frames advance every ~700ms.
-  // Rebuilding thousands of vectors per tick locks the tab — skip it and let the
-  // hazard overlay (separate effect) carry the animation. Vectors refresh on pause.
-  const vectorRenderKeyRef = useRef<string>('');
   const viewportTimerRef = useRef<number | null>(null);
   const onIgnitionSelectRef = useRef(onIgnitionSelect);
   const disasterTypeRef = useRef(disasterType);
@@ -803,17 +799,6 @@ export default function MapView({
     const sim = result.simulation;
     const frames = sim?.frames || [];
     const frameIdx = Math.min(currentFrame, Math.max(0, frames.length - 1));
-
-    // Playback guard: during active timeline playback, skip heavy vector DOM rebuilds to keep FPS smooth.
-    // On pause or manual slider scrubbing, vectors update to match frameIdx.
-    // NOTE: frameIdx is deliberately NOT part of renderKey — including it would
-    // change the key every tick and disable the guard (tab freeze during play).
-    const vpKey = mapViewport
-      ? `${mapViewport.south.toFixed(4)},${mapViewport.west.toFixed(4)},${mapViewport.north.toFixed(4)},${mapViewport.east.toFixed(4)}`
-      : 'novp';
-    const renderKey = `${result.run_uuid || 'noid'}-${mapZoom}-${buildingDensity || 'medium'}-${vpKey}`;
-    if (isPlaying && vectorRenderKeyRef.current === renderKey) return;
-    vectorRenderKeyRef.current = renderKey;
 
     // Viewport culling: render only features the user can actually see (+10% margin
     // so markers don't pop at the edges). Falls back to everything until the
@@ -1234,7 +1219,7 @@ export default function MapView({
         setSelectedBuilding(null);
       });
     });
-  }, [result, currentFrame, mapZoom, mapViewport, buildingDensity, isPlaying]);
+  }, [result, currentFrame, mapZoom, mapViewport, buildingDensity]);
 
   // Render Evacuation Routes
   useEffect(() => {
