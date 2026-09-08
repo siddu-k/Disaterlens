@@ -58,6 +58,7 @@ class ParsedScenario(BaseModel):
     disaster_type: str = Field(description="One of: flood, earthquake, wildfire, landslide, cyclone")
     parameters: Dict[str, float] = Field(description="Key-value mapping of numerical scenario parameters")
     confidence: float = Field(description="Confidence score 0.0 - 1.0")
+    explanation: Optional[str] = Field(default=None, description="Concise 1-2 sentence explanation of the parameters assigned and physical context")
     clarification_needed: Optional[str] = Field(default=None, description="Any ambiguity or missing parameter note")
 
 
@@ -78,45 +79,114 @@ class AIInsight(BaseModel):
     data_citations: List[str] = Field(description="Citations of datasets and model versions used")
 
 
-def parse_natural_language_scenario(prompt: str, current_disaster: str = "flood") -> Dict[str, Any]:
+def parse_natural_language_scenario(
+    prompt: str,
+    current_disaster: str = "flood",
+    model: Optional[str] = "gemini-3.5-flash-lite",
+) -> Dict[str, Any]:
     """
     Parse a user prompt like 'Simulate 300mm rain in 12 hours with 2m surge'
-    into strict validated numerical parameters.
+    into strict validated numerical parameters using client.interactions.create with gemini-3.5-flash-lite.
     """
+    target_model = model or "gemini-3.5-flash-lite"
     if not config.GEMINI_API_KEY or genai is None:
         return _fallback_parse_scenario(prompt, current_disaster)
 
-    try:
-        client = _get_client()
-        if client is None:
-            return _fallback_parse_scenario(prompt, current_disaster)
-        system_instructions = (
-            "You are a strict disaster scenario parameter extractor. Extract ONLY numerical scenario parameters "
-            "into JSON for the disaster simulation engines. Valid disasters: flood (rainfall_mm, duration_hours, sea_level_surge_m), "
-            "earthquake (magnitude, depth_km), wildfire (wind_speed_kmh, wind_direction_deg, temperature_c, relative_humidity_pct), "
-            "landslide (cumulative_rainfall_mm, duration_hours), cyclone (central_pressure_hpa, max_wind_kmh). "
-            "Never invent parameters outside user context."
-        )
+    client = _get_client()
+    if client is None:
+        return _fallback_parse_scenario(prompt, current_disaster)
 
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=f"{system_instructions}\nUser Request: {_truncate(prompt)}\nDefault Disaster: {current_disaster}",
-            config={
-                "response_mime_type": "application/json",
-                "response_schema": ParsedScenario,
-            },
-        )
-        if response.parsed:
-            p = response.parsed
-            return {
-                "disaster_type": _validate_disaster_type(p.disaster_type),
-                "parameters": p.parameters,
-                "confidence": p.confidence,
-                "clarification": p.clarification_needed,
-                "source": "gemini",
-            }
-    except Exception as e:
-        logger.warning(f"[AI Parser] Warning: {e}")
+    # 1. Primary path: client.interactions.create with model="gemini-3.5-flash-lite"
+    if hasattr(client, "interactions") and callable(getattr(client.interactions, "create", None)):
+        try:
+            interaction = client.interactions.create(
+                model=target_model,
+                input=(
+                    "You are a strict disaster scenario parameter extractor for DisasterLens. "
+                    "Extract numerical scenario parameters from the prompt and return valid JSON ONLY.\n"
+                    "JSON schema:\n"
+                    "{\n"
+                    '  "disaster_type": "flood" | "cyclone" | "earthquake" | "wildfire" | "landslide",\n'
+                    '  "parameters": {\n'
+                    '    // for flood: "rainfall_mm", "duration_hours", "sea_level_surge_m"\n'
+                    '    // for cyclone: "max_wind_kmh", "central_pressure_hpa", "cyclone_direction_deg", "cyclone_radius_km", "storm_radius_km", "forward_speed_kmh", "duration_hours"\n'
+                    '    // for earthquake: "magnitude", "depth_km"\n'
+                    '    // for wildfire: "wind_speed_kmh", "wind_direction_deg", "temperature_c", "relative_humidity_pct"\n'
+                    '    // for landslide: "cumulative_rainfall_mm", "duration_hours"\n'
+                    "  },\n"
+                    '  "confidence": 0.95,\n'
+                    '  "explanation": "Brief 1-2 sentence explanation of extracted values."\n'
+                    "}\n\n"
+                    f"User Prompt: {_truncate(prompt)}\n"
+                    f"Default Disaster: {current_disaster}"
+                ),
+            )
+            raw_text = getattr(interaction, "output_text", None)
+            if not raw_text and hasattr(interaction, "outputs") and interaction.outputs:
+                raw_text = str(interaction.outputs[0])
+            if raw_text:
+                clean_text = raw_text.strip()
+                if clean_text.startswith("```json"):
+                    clean_text = clean_text[7:]
+                elif clean_text.startswith("```"):
+                    clean_text = clean_text[3:]
+                if clean_text.endswith("```"):
+                    clean_text = clean_text[:-3]
+                clean_text = clean_text.strip()
+                data = json.loads(clean_text)
+                dtype = _validate_disaster_type(data.get("disaster_type", current_disaster))
+                params = {
+                    k: float(v)
+                    for k, v in data.get("parameters", {}).items()
+                    if isinstance(v, (int, float, str)) and str(v).replace(".", "", 1).isdigit()
+                }
+                expl = data.get("explanation") or f"Assigned {dtype.capitalize()} parameters using {target_model}."
+                return {
+                    "disaster_type": dtype,
+                    "parameters": params,
+                    "confidence": float(data.get("confidence", 0.95)),
+                    "explanation": expl,
+                    "clarification": data.get("clarification_needed"),
+                    "source": f"Google {target_model}",
+                    "model": target_model,
+                }
+        except Exception as e:
+            logger.warning(f"[AI Parser] client.interactions.create with {target_model} failed: {e}")
+
+    # 2. Secondary path: client.models.generate_content with model="gemini-3.5-flash-lite" (with fallback to 2.0)
+    system_instructions = (
+        "You are a strict disaster scenario parameter extractor for DisasterLens. Extract numerical scenario parameters "
+        "into JSON for physical simulation models. Valid disaster types: flood (rainfall_mm, duration_hours, sea_level_surge_m), "
+        "earthquake (magnitude, depth_km), wildfire (wind_speed_kmh, wind_direction_deg, temperature_c, relative_humidity_pct), "
+        "landslide (cumulative_rainfall_mm, duration_hours), cyclone (central_pressure_hpa, max_wind_kmh, cyclone_direction_deg, cyclone_radius_km, storm_radius_km, forward_speed_kmh, duration_hours). "
+        "Provide a concise explanation explaining what values you extracted and why."
+    )
+
+    for active_model in [target_model, "gemini-2.0-flash-lite", "gemini-2.0-flash"]:
+        try:
+            response = client.models.generate_content(
+                model=active_model,
+                contents=f"{system_instructions}\nUser Request: {_truncate(prompt)}\nDefault Disaster: {current_disaster}",
+                config={
+                    "response_mime_type": "application/json",
+                    "response_schema": ParsedScenario,
+                },
+            )
+            if response.parsed:
+                p = response.parsed
+                expl = p.explanation or f"Assigned {p.disaster_type} parameters based on scenario request."
+                return {
+                    "disaster_type": _validate_disaster_type(p.disaster_type),
+                    "parameters": p.parameters,
+                    "confidence": p.confidence,
+                    "explanation": expl,
+                    "clarification": p.clarification_needed,
+                    "source": f"Google {active_model}",
+                    "model": active_model,
+                }
+        except Exception as e:
+            logger.warning(f"[AI Parser] Model {active_model} generate_content failed: {e}")
+            continue
 
     return _fallback_parse_scenario(prompt, current_disaster)
 
@@ -217,9 +287,9 @@ def _fallback_parse_scenario(prompt: str, current_disaster: str) -> Dict[str, An
     if dur_m:
         params["duration_hours"] = float(dur_m.group(1))
 
-    # Extract surge (e.g. 2.5m surge, 2 meter)
-    surge_m = re.search(r"(\d+(?:\.\d+)?)\s*(?:m|meter|meters)\s*(?:surge)?", p_lower)
-    if surge_m and "surge" in p_lower:
+    # Extract surge (e.g. 2.5m surge, 2 meter surge, surge of 2.5m)
+    surge_m = re.search(r"(\d+(?:\.\d+)?)\s*(?:m|meter|meters)?\s*(?:storm\s*)?surge", p_lower) or re.search(r"surge\s*(?:of\s*)?(\d+(?:\.\d+)?)\s*(?:m|meter|meters)?", p_lower)
+    if surge_m:
         params["sea_level_surge_m"] = float(surge_m.group(1))
 
     # Extract magnitude (e.g. M7.0, magnitude 6.5)
@@ -233,12 +303,17 @@ def _fallback_parse_scenario(prompt: str, current_disaster: str) -> Dict[str, An
         params["wind_speed_kmh"] = float(wind_m.group(1))
         params["max_wind_kmh"] = float(wind_m.group(1))
 
+    param_summary = ", ".join(f"{k}={v}" for k, v in params.items()) if params else "standard baseline parameters"
+    explanation = f"Detected {dtype.capitalize()} scenario. Extracted {param_summary} from prompt."
+
     return {
         "disaster_type": _validate_disaster_type(dtype),
         "parameters": params,
         "confidence": 0.85,
+        "explanation": explanation,
         "clarification": None,
-        "source": "rule-based parser",
+        "source": "Scientific Rule Engine",
+        "model": "offline-rule-engine",
     }
 
 

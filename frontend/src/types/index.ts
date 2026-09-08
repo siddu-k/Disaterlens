@@ -23,11 +23,23 @@ export interface SimulationRequest {
   wind_direction_deg?: number;
   temperature_c?: number;
   relative_humidity_pct?: number;
+  ignition_lat?: number;
+  ignition_lon?: number;
+  initial_fire_radius_m?: number;
+  fuel_type?: string;
+  fuel_moisture_pct?: number | string;
+  slope_deg?: number | string;
+  aspect_direction?: string;
+  recent_rainfall_mm?: number;
   // Landslide
   cumulative_rainfall_mm?: number;
   // Cyclone
   central_pressure_hpa?: number;
   max_wind_kmh?: number;
+  cyclone_direction_deg?: number;
+  cyclone_radius_km?: number;
+  storm_radius_km?: number;
+  forward_speed_kmh?: number;
 }
 
 export interface RoadFeature {
@@ -185,6 +197,7 @@ export interface ProvenanceResponse {
 
 export interface SimulationResult {
   run_uuid: string;
+  metadata?: Record<string, any>;
   simulation: {
     timesteps: number[];
     frames: number[][][];
@@ -199,6 +212,7 @@ export interface SimulationResult {
     disaster_type: string;
     hazard_unit: string;
     model_name: string;
+    metadata?: Record<string, any>;
   };
   impact: {
     disaster_type: string;

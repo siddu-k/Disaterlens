@@ -65,3 +65,25 @@ def test_invalid_disaster_type_rejected():
     """An unknown disaster_type must be rejected with 422."""
     res = client.post("/api/simulate", json=_simulate_payload(disaster_type="tornado"))
     assert res.status_code == 422
+
+
+def test_fuel_moisture_pct_auto_accepted():
+    """'auto' for fuel_moisture_pct, slope_deg, and aspect_direction must pass validation without 422."""
+    from main import SimulationRequest
+    req = SimulationRequest(
+        bbox=dict(MUMBAI_GS_WARD_BBOX),
+        disaster_type="wildfire",
+        fuel_moisture_pct="auto",
+        slope_deg="auto",
+        aspect_direction="auto",
+    )
+    assert req.fuel_moisture_pct is None
+    assert req.slope_deg is None
+    assert req.aspect_direction == "south"
+
+
+def test_fuel_moisture_pct_out_of_range_rejected():
+    """Numeric fuel_moisture_pct outside [1, 45] must be rejected with 422."""
+    res = client.post("/api/simulate", json=_simulate_payload(fuel_moisture_pct=99.0))
+    assert res.status_code == 422
+

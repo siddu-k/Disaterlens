@@ -53,7 +53,7 @@ function isCellHazardActive(disaster: string, val: number, peak: number): boolea
   if (val <= 0.005) return false;
   if (disaster === 'wildfire') return val > 0.04;
   if (disaster === 'earthquake') return val > (peak > 4 ? 3.0 : peak * 0.12);
-  if (disaster === 'cyclone') return val > (peak > 50 ? 40 : peak * 0.18);
+  if (disaster === 'cyclone') return val > (peak > 80 ? 62.0 : 40.0);
   if (disaster === 'landslide') return val > 0.12;
   return val > 0.03; // flood depth meters
 }
@@ -66,8 +66,8 @@ function getNormHazard(disaster: string, val: number, peak: number): number {
     return Math.min(1.0, Math.max(0, (val - minM) / Math.max(1, peak - minM)));
   }
   if (disaster === 'cyclone') {
-    const minW = peak > 50 ? 40 : 0;
-    return Math.min(1.0, Math.max(0, (val - minW) / Math.max(10, peak - minW)));
+    const minW = peak > 80 ? 62.0 : 35.0;
+    return Math.min(1.0, Math.max(0, (val - minW) / Math.max(20, peak - minW)));
   }
   if (disaster === 'wildfire') {
     return Math.min(1.0, Math.max(0, val / Math.max(0.1, peak)));
@@ -76,6 +76,169 @@ function getNormHazard(disaster: string, val: number, peak: number): number {
     return Math.min(1.0, Math.max(0, val / Math.max(0.15, peak)));
   }
   return Math.min(1.0, Math.max(0, val / Math.max(0.5, peak)));
+}
+
+// ─── 3D Tile Hit-Testing & Canvas Affine Texture Mapping ───
+function isPointInQuad(
+  px: number,
+  py: number,
+  p0: { x: number; y: number },
+  p1: { x: number; y: number },
+  p2: { x: number; y: number },
+  p3: { x: number; y: number }
+): boolean {
+  const pts = [p0, p1, p2, p3];
+  let inside = false;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+    const xi = pts[i].x;
+    const yi = pts[i].y;
+    const xj = pts[j].x;
+    const yj = pts[j].y;
+    const intersect = yi > py !== yj > py && px < ((xj - xi) * (py - yi)) / (yj - yi) + xi;
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
+function drawTriangleTexture(
+  ctx: CanvasRenderingContext2D,
+  img: HTMLImageElement,
+  x0: number, y0: number, u0: number, v0: number,
+  x1: number, y1: number, u1: number, v1: number,
+  x2: number, y2: number, u2: number, v2: number
+) {
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(x0, y0);
+  ctx.lineTo(x1, y1);
+  ctx.lineTo(x2, y2);
+  ctx.closePath();
+  ctx.clip();
+
+  const delta = u0 * (v1 - v2) - v0 * (u1 - u2) + (u1 * v2 - u2 * v1);
+  if (Math.abs(delta) < 0.0001) {
+    ctx.restore();
+    return;
+  }
+  const deltaA = x0 * (v1 - v2) - v0 * (x1 - x2) + (x1 * v2 - x2 * v1);
+  const deltaB = u0 * (x1 - x2) - x0 * (u1 - u2) + (u1 * x2 - u2 * x1);
+  const deltaC = u0 * (v1 * x2 - v2 * x1) - v0 * (u1 * x2 - u2 * x1) + x0 * (u1 * v2 - u2 * v1);
+  const deltaD = y0 * (v1 - v2) - v0 * (y1 - y2) + (y1 * v2 - y2 * v1);
+  const deltaE = u0 * (y1 - y2) - y0 * (u1 - u2) + (u1 * y2 - u2 * y1);
+  const deltaF = u0 * (v1 * y2 - v2 * y1) - v0 * (u1 * y2 - u2 * y1) + y0 * (u1 * v2 - u2 * v1);
+
+  ctx.transform(
+    deltaA / delta,
+    deltaD / delta,
+    deltaB / delta,
+    deltaE / delta,
+    deltaC / delta,
+    deltaF / delta
+  );
+  ctx.drawImage(img, 0, 0);
+  ctx.restore();
+}
+
+function drawTexturedQuad(
+  ctx: CanvasRenderingContext2D,
+  img: HTMLImageElement,
+  p00: { x: number; y: number },
+  p10: { x: number; y: number },
+  p11: { x: number; y: number },
+  p01: { x: number; y: number },
+  u0 = 0,
+  v0 = 0,
+  u1 = 1,
+  v1 = 1
+) {
+  const w = img.naturalWidth || img.width || 256;
+  const h = img.naturalHeight || img.height || 256;
+  const sx0 = u0 * w;
+  const sy0 = v0 * h;
+  const sx1 = u1 * w;
+  const sy1 = v1 * h;
+  drawTriangleTexture(ctx, img, p00.x, p00.y, sx0, sy0, p10.x, p10.y, sx1, sy0, p01.x, p01.y, sx0, sy1);
+  drawTriangleTexture(ctx, img, p11.x, p11.y, sx1, sy1, p10.x, p10.y, sx1, sy0, p01.x, p01.y, sx0, sy1);
+}
+
+// ─── Tactical Satellite View of Selected Tile (Cropped from full AOI Image) ───
+function TileSatelliteCanvas({
+  aoiSatImg,
+  selectedTileData,
+  cols,
+  rows,
+}: {
+  aoiSatImg: HTMLImageElement | null;
+  selectedTileData: any;
+  cols: number;
+  rows: number;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const W = 320;
+    const H = 160;
+    ctx.clearRect(0, 0, W, H);
+
+    const { r, c } = selectedTileData;
+    const u0 = c / Math.max(1, cols - 1);
+    const u1 = (c + 1) / Math.max(1, cols - 1);
+    const v0 = r / Math.max(1, rows - 1);
+    const v1 = (r + 1) / Math.max(1, rows - 1);
+
+    if (aoiSatImg && aoiSatImg.complete && aoiSatImg.naturalWidth > 0) {
+      const iw = aoiSatImg.naturalWidth;
+      const ih = aoiSatImg.naturalHeight;
+      const sx = u0 * iw;
+      const sy = v0 * ih;
+      const sw = Math.max(1, (u1 - u0) * iw);
+      const sh = Math.max(1, (v1 - v0) * ih);
+      ctx.drawImage(aoiSatImg, sx, sy, sw, sh, 0, 0, W, H);
+    } else {
+      // Sleek radar acquisition grid
+      ctx.fillStyle = '#090d16';
+      ctx.fillRect(0, 0, W, H);
+      ctx.strokeStyle = 'rgba(56, 189, 248, 0.2)';
+      ctx.lineWidth = 1;
+      for (let x = 0; x < W; x += 32) {
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, H);
+        ctx.stroke();
+      }
+      for (let y = 0; y < H; y += 24) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(W, y);
+        ctx.stroke();
+      }
+      ctx.fillStyle = '#38bdf8';
+      ctx.font = '600 11px "JetBrains Mono", monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('🛰️ ACQUIRING OPTICAL SATELLITE...', W / 2, H / 2);
+    }
+
+    // Optical tactical crosshair in center
+    ctx.strokeStyle = 'rgba(56, 189, 248, 0.7)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(W / 2 - 12, H / 2);
+    ctx.lineTo(W / 2 + 12, H / 2);
+    ctx.moveTo(W / 2, H / 2 - 12);
+    ctx.lineTo(W / 2, H / 2 + 12);
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.arc(W / 2, H / 2, 7, 0, Math.PI * 2);
+    ctx.stroke();
+  }, [aoiSatImg, selectedTileData, cols, rows]);
+
+  return <canvas ref={canvasRef} width={320} height={160} className="terrain3d-sat-card-img" />;
 }
 
 // ─── Static 2D Reference Snapshot of Selected Box ───
@@ -395,8 +558,8 @@ export default function Terrain3DViewer({
   // Free-orbit camera: yaw wraps 360°, pitch 0° (horizon) -> 90° (top-down)
   const [yaw, setYaw] = useState<number>(45); // degrees
   const [pitch, setPitch] = useState<number>(35); // degrees
-  const [zoom, setZoom] = useState<number>(1.35);
-  const [zExaggeration, setZExaggeration] = useState<number>(3.5);
+  const [zoom, setZoom] = useState<number>(1.85);
+  const [zExaggeration, setZExaggeration] = useState<number>(1.0);
   const [isDragging, setIsDragging] = useState<boolean>(false);
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
   const [show2DReference, setShow2DReference] = useState<boolean>(false);
@@ -413,6 +576,28 @@ export default function Terrain3DViewer({
   const [physicsEnabled, setPhysicsEnabled] = useState<boolean>(true);
   const [wavePhase, setWavePhase] = useState<number>(0);
   const [tileNumberMode, setTileNumberMode] = useState<'id' | 'elev' | 'hazard' | 'off'>('id');
+  const [showBuildings, setShowBuildings] = useState<boolean>(true);
+
+  // ─── 3D Selected Tile & Floating Satellite Hover State ───
+  const [selectedTile, setSelectedTile] = useState<{ r: number; c: number } | null>(null);
+  const [hoveredTile, setHoveredTile] = useState<{ r: number; c: number } | null>(null);
+  const satelliteHeight = 85;
+  const [renderNonce, setRenderNonce] = useState<number>(0);
+
+  const dragStartPos = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const dragModeRef = useRef<'orbit' | 'zoom'>('orbit');
+  const hasMovedDrag = useRef<boolean>(false);
+  const screenQuadsRef = useRef<Array<{
+    r: number;
+    c: number;
+    depth: number;
+    p00: { x: number; y: number };
+    p10: { x: number; y: number };
+    p11: { x: number; y: number };
+    p01: { x: number; y: number };
+  }>>([]);
+  const tileImgRef = useRef<HTMLImageElement | null>(null);
+  const floatingCardRef = useRef<HTMLDivElement | null>(null);
 
   const animFrameRef = useRef<number>(currentFrame);
   animFrameRef.current = animFrame;
@@ -542,8 +727,8 @@ export default function Terrain3DViewer({
   const resetCamera = () => {
     setYaw(45);
     setPitch(35);
-    setZoom(1.35);
-    setZExaggeration(3.5);
+    setZoom(1.85);
+    setZExaggeration(1.0);
   };
 
   const elev = result.elevation;
@@ -583,6 +768,73 @@ export default function Terrain3DViewer({
       subFraction: smoothAlpha,
     };
   }, [frames, totalFrames, animFrame]);
+
+  // Preload full AOI satellite image once (guaranteed valid bbox, zero 500 errors)
+  const aoiBox = result.aoi_bbox || result.bbox;
+  const aoiSatUrl = useMemo(() => {
+    return `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/export?bbox=${aoiBox.west},${aoiBox.south},${aoiBox.east},${aoiBox.north}&bboxSR=4326&size=800,800&imageSR=4326&format=jpg&f=image`;
+  }, [aoiBox.west, aoiBox.south, aoiBox.east, aoiBox.north]);
+
+  const [aoiSatImg, setAoiSatImg] = useState<HTMLImageElement | null>(null);
+
+  useEffect(() => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.src = aoiSatUrl;
+    img.onload = () => {
+      setAoiSatImg(img);
+      setRenderNonce((n) => n + 1);
+    };
+    img.onerror = () => {
+      // Gracefully handled by fallback radar canvas
+    };
+  }, [aoiSatUrl]);
+
+  // Derived telemetry data for selected tile
+  const selectedTileData = useMemo(() => {
+    if (!selectedTile) return null;
+    const { r, c } = selectedTile;
+    if (r < 0 || r >= rows - 1 || c < 0 || c >= cols - 1) return null;
+    const u0 = c / Math.max(1, cols - 1);
+    const u1 = (c + 1) / Math.max(1, cols - 1);
+    const v0 = r / Math.max(1, rows - 1);
+    const v1 = (r + 1) / Math.max(1, rows - 1);
+    const b = result.bbox;
+    const tileWest = b.west + u0 * (b.east - b.west);
+    const tileEast = b.west + u1 * (b.east - b.west);
+    const tileNorth = b.north - v0 * (b.north - b.south);
+    const tileSouth = b.north - v1 * (b.north - b.south);
+    const tileLat = (tileNorth + tileSouth) / 2;
+    const tileLon = (tileWest + tileEast) / 2;
+
+    const e00 = elevGrid[r]?.[c] ?? minElev;
+    const e10 = elevGrid[r]?.[c + 1] ?? minElev;
+    const e11 = elevGrid[r + 1]?.[c + 1] ?? minElev;
+    const e01 = elevGrid[r + 1]?.[c] ?? minElev;
+    const avgElev = (e00 + e10 + e11 + e01) / 4;
+
+    const wA = currentHazardGrid[r]?.[c] ?? 0;
+    const wB = nextHazardGrid[r]?.[c] ?? wA;
+    const avgHazard = wA + (wB - wA) * subFraction;
+    const normH = getNormHazard(hazardType, avgHazard, peakVal);
+
+    const tileId = r * (cols - 1) + c + 1;
+
+    return {
+      r,
+      c,
+      tileId,
+      tileWest,
+      tileEast,
+      tileNorth,
+      tileSouth,
+      tileLat,
+      tileLon,
+      avgElev,
+      avgHazard,
+      normH,
+    };
+  }, [selectedTile, cols, rows, result.bbox, elevGrid, minElev, currentHazardGrid, nextHazardGrid, subFraction, hazardType, peakVal]);
 
   // Render 3D Canvas Engine with Hazard-Specific Real-Time Physics & Animation
   useEffect(() => {
@@ -631,7 +883,7 @@ export default function Terrain3DViewer({
     const elevSpan = Math.max(1, maxElev - minElev);
     const centerX = width / 2;
     const centerY = height / 2 + 10;
-    const baseScale = Math.min(width, height) * 0.46 * zoom;
+    const baseScale = Math.min(width, height) * 0.52 * zoom;
 
     // Project 3D point (u, v in [0, 1], zMeters) into 2D screen coordinates
     const project = (u: number, v: number, zMeters: number) => {
@@ -675,6 +927,15 @@ export default function Terrain3DViewer({
       return `rgb(${r}, ${g}, ${b})`;
     };
 
+    // Extract Wildfire physical simulation metadata
+    const wfSimMeta = (result.simulation as any)?.metadata || {};
+    const wfWindDir = Number(wfSimMeta.wind_direction_deg ?? 135);
+    const wfWindSpeed = Number(wfSimMeta.wind_speed_kmh ?? 25);
+    const wfDirRad = (wfWindDir * Math.PI) / 180;
+    const wfDownwindU = Math.sin(wfDirRad);
+    const wfDownwindV = -Math.cos(wfDirRad);
+    const wfLeanMagnitude = Math.min(0.045, 0.012 + (wfWindSpeed / 100) * 0.035);
+
     // Build mesh quads with depth sorting for correct 3D occlusion
     const quads: Array<{ r: number; c: number; depth: number }> = [];
     for (let r = 0; r < rows - 1; r++) {
@@ -694,6 +955,27 @@ export default function Terrain3DViewer({
 
     // Sort back-to-front (largest depth rendered first)
     quads.sort((a, b) => b.depth - a.depth);
+
+    // Cache projected quad corners for mouse hit-testing (front-to-back order)
+    screenQuadsRef.current = quads.slice().reverse().map(({ r, c, depth }) => {
+      const u0 = c / (cols - 1);
+      const u1 = (c + 1) / (cols - 1);
+      const v0 = r / (rows - 1);
+      const v1 = (r + 1) / (rows - 1);
+      const e00 = elevGrid[r]?.[c] ?? minElev;
+      const e10 = elevGrid[r]?.[c + 1] ?? minElev;
+      const e11 = elevGrid[r + 1]?.[c + 1] ?? minElev;
+      const e01 = elevGrid[r + 1]?.[c] ?? minElev;
+      return {
+        r,
+        c,
+        depth,
+        p00: project(u0, v0, e00),
+        p10: project(u1, v0, e10),
+        p11: project(u1, v1, e11),
+        p01: project(u0, v1, e01),
+      };
+    });
 
     // Dynamic wave perturbation function (hydrodynamic waves for flood)
     const getWaveOffset = (u: number, v: number, waterDepth: number) => {
@@ -793,11 +1075,13 @@ export default function Terrain3DViewer({
           const bL = Math.round(9 * normH + (1 - normH) * 70);
           faceColor = `rgb(${rL}, ${gL}, ${bL})`;
         } else if (hazardType === 'cyclone') {
-          // High wind shear turbulence shading
-          const rC = Math.round(14 * normH + (1 - normH) * 50);
-          const gC = Math.round(165 * normH + (1 - normH) * 110);
-          const bC = Math.round(233 * normH + (1 - normH) * 70);
-          faceColor = `rgb(${rC}, ${gC}, ${bC})`;
+          // High wind shear turbulence shading (only above cyclonic gale threshold >= 62 km/h)
+          if (avgHazard >= 62.0) {
+            const rC = Math.round(14 * normH + (1 - normH) * 50);
+            const gC = Math.round(165 * normH + (1 - normH) * 110);
+            const bC = Math.round(233 * normH + (1 - normH) * 70);
+            faceColor = `rgb(${rC}, ${gC}, ${bC})`;
+          }
         }
       }
 
@@ -838,8 +1122,11 @@ export default function Terrain3DViewer({
           const flicker = physicsEnabled
             ? Math.sin(wavePhase * 6.5 + uMid * 30.0) * 0.35 + Math.cos(wavePhase * 4.8 + vMid * 25.0) * 0.25
             : 0;
-          const windSwayX = 0.012 * Math.sin(wavePhase * 3.0);
-          const windSwayY = -0.015; // wind pushing northeast
+          const swayNoise = physicsEnabled
+            ? Math.sin(wavePhase * 4.5 + uMid * 20.0) * 0.005
+            : 0;
+          const windSwayX = wfDownwindU * wfLeanMagnitude + swayNoise;
+          const windSwayY = wfDownwindV * wfLeanMagnitude + swayNoise;
 
           const groundMidE = avgElev;
           const apex = project(uMid + windSwayX, vMid + windSwayY, groundMidE + flameH * (1.0 + flicker));
@@ -951,15 +1238,41 @@ export default function Terrain3DViewer({
         }
       }
 
-      // 4. CYCLONE: Coastal Storm Surge Inundation
+      // 4. CYCLONE: Coastal Storm Surge Hydrodynamic Inundation
       else if (hazardType === 'cyclone') {
-        const isLowElevation = avgElev <= minElev + elevSpan * 0.28;
-        if (isLowElevation && isHazardActive) {
-          const surgeH = 0.4 + normH * 2.2;
-          const sp00 = project(u0, v0, e00 + surgeH);
-          const sp10 = project(u1, v0, e10 + surgeH);
-          const sp11 = project(u1, v1, e11 + surgeH);
-          const sp01 = project(u0, v1, e01 + surgeH);
+        const meta = (result.simulation as any)?.metadata || {};
+        const surgeGrid: number[][] | undefined = meta.surge_grid;
+        const cellSurge = surgeGrid?.[r]?.[c] ?? 0;
+        const isLowElevation = avgElev <= minElev + elevSpan * 0.25;
+
+        // Dynamic time-dependent storm surge factor from simulation timeline
+        const surgeTimeFactors: number[] | undefined = meta.surge_time_factors;
+        let timeSurgeFactor = 0;
+        if (surgeTimeFactors && surgeTimeFactors.length > 0) {
+          const curF = Math.min(surgeTimeFactors.length - 1, Math.max(0, Math.floor(animFrame)));
+          const nxtF = Math.min(surgeTimeFactors.length - 1, curF + 1);
+          const fA = surgeTimeFactors[curF] ?? 0;
+          const fB = surgeTimeFactors[nxtF] ?? fA;
+          timeSurgeFactor = fA + (fB - fA) * subFraction;
+        } else {
+          // Fallback based on local wind intensity exceeding tropical gale threshold (62 km/h)
+          timeSurgeFactor = Math.min(1.0, Math.max(0, (avgHazard - 35) / Math.max(30, peakVal - 35)));
+        }
+
+        const effectiveSurge = cellSurge * Math.pow(timeSurgeFactor, 1.25);
+        const hasSurge = isLowElevation && effectiveSurge > 0.05;
+
+        if (hasSurge) {
+          const surgeWaterElev = Math.max(avgElev + 0.12, minElev + effectiveSurge);
+          const wOff00 = physicsEnabled ? Math.sin(u0 * 20 + wavePhase * 3.2) * 0.08 : 0;
+          const wOff10 = physicsEnabled ? Math.sin(u1 * 20 + wavePhase * 3.2) * 0.08 : 0;
+          const wOff11 = physicsEnabled ? Math.sin(u1 * 20 + wavePhase * 3.2) * 0.08 : 0;
+          const wOff01 = physicsEnabled ? Math.sin(u0 * 20 + wavePhase * 3.2) * 0.08 : 0;
+
+          const sp00 = project(u0, v0, Math.max(e00, surgeWaterElev) + wOff00);
+          const sp10 = project(u1, v0, Math.max(e10, surgeWaterElev) + wOff10);
+          const sp11 = project(u1, v1, Math.max(e11, surgeWaterElev) + wOff11);
+          const sp01 = project(u0, v1, Math.max(e01, surgeWaterElev) + wOff01);
 
           ctx.beginPath();
           ctx.moveTo(sp00.x, sp00.y);
@@ -967,11 +1280,13 @@ export default function Terrain3DViewer({
           ctx.lineTo(sp11.x, sp11.y);
           ctx.lineTo(sp01.x, sp01.y);
           ctx.closePath();
-          ctx.fillStyle = 'rgba(6, 182, 212, 0.72)';
+
+          // Coastal storm surge water color: deep sea cyan with translucent specular foam
+          ctx.fillStyle = 'rgba(6, 182, 212, 0.78)';
           ctx.fill();
 
-          ctx.strokeStyle = 'rgba(255, 255, 255, 0.65)';
-          ctx.lineWidth = 1.2;
+          ctx.strokeStyle = 'rgba(255, 255, 255, 0.55)';
+          ctx.lineWidth = 1.0;
           ctx.stroke();
         }
       }
@@ -1078,29 +1393,157 @@ export default function Terrain3DViewer({
       }
     });
 
-    // ─── CYCLONE: Atmospheric 3D Rotating Vortex Streamlines Orbiting Eye ───
-    if (hazardType === 'cyclone' && peakVal > 20) {
-      const vortexAltitude = maxElev + 6.0;
-      const numArms = 5;
-      const eyeU = 0.5;
-      const eyeV = 0.5;
-      const maxRadius = 0.48;
+    // ─── CYCLONE: Dynamic Moving 3D Atmospheric Vortex, Eyewall & Ground Track ───
+    if (hazardType === 'cyclone' && peakVal > 15) {
+      const meta = (result.simulation as any)?.metadata || {};
+      const trackPoints: Array<{ time_h: number; lat: number; lon: number; eye_u: number; eye_v: number; wind_kmh: number }> =
+        meta.track_points || [];
+      const dirDeg = Number(meta.cyclone_direction_deg ?? 315);
+      const rMaxKm = Number(meta.cyclone_radius_km ?? 35);
+      const stormRadiusKm = Number(meta.storm_radius_km ?? 180);
+      const category = String(meta.saffir_simpson_category || 'Tropical Storm');
+
+      // Continuous dynamic eye interpolation along the calculated simulation track
+      const tFrac = Math.max(0, Math.min(1, animFrame / Math.max(totalFrames - 1, 1)));
+      let eyeU = 0.5;
+      let eyeV = 0.5;
+      let curWindKmh = peakVal;
+
+      if (trackPoints.length >= 2) {
+        const trackPos = tFrac * (trackPoints.length - 1);
+        const idxA = Math.floor(trackPos);
+        const idxB = Math.min(trackPoints.length - 1, idxA + 1);
+        const subT = trackPos - idxA;
+        const ptA = trackPoints[idxA];
+        const ptB = trackPoints[idxB];
+        eyeU = ptA.eye_u + subT * (ptB.eye_u - ptA.eye_u);
+        eyeV = ptA.eye_v + subT * (ptB.eye_v - ptA.eye_v);
+        curWindKmh = ptA.wind_kmh + subT * (ptB.wind_kmh - ptA.wind_kmh);
+      } else {
+        // Fallback directional movement along dirDeg
+        const dirRad = ((dirDeg - 90) * Math.PI) / 180;
+        const spanDist = 0.9;
+        eyeU = 0.5 + (tFrac - 0.5) * Math.cos(dirRad) * spanDist;
+        eyeV = 0.5 + (tFrac - 0.5) * Math.sin(dirRad) * spanDist;
+      }
+
+      const clampEyeR = Math.min(rows - 1, Math.max(0, Math.floor(eyeV * rows)));
+      const clampEyeC = Math.min(cols - 1, Math.max(0, Math.floor(eyeU * cols)));
+      const eyeGroundElev = elevGrid[clampEyeR]?.[clampEyeC] ?? minElev;
+      const vortexAltitude = Math.max(maxElev + 10.0, eyeGroundElev + 14.0);
 
       ctx.save();
+
+      // 1. Projected 3D Ground Trajectory Track across the terrain
+      if (trackPoints.length >= 2) {
+        ctx.beginPath();
+        let trackStarted = false;
+        trackPoints.forEach((pt) => {
+          if (pt.eye_u < -0.15 || pt.eye_u > 1.15 || pt.eye_v < -0.15 || pt.eye_v > 1.15) return;
+          const pr = Math.min(rows - 1, Math.max(0, Math.floor(pt.eye_v * rows)));
+          const pc = Math.min(cols - 1, Math.max(0, Math.floor(pt.eye_u * cols)));
+          const gE = (elevGrid[pr]?.[pc] ?? minElev) + 2.0;
+          const pScreen = project(pt.eye_u, pt.eye_v, gE);
+          if (!trackStarted) {
+            ctx.moveTo(pScreen.x, pScreen.y);
+            trackStarted = true;
+          } else {
+            ctx.lineTo(pScreen.x, pScreen.y);
+          }
+        });
+        ctx.strokeStyle = 'rgba(250, 204, 21, 0.85)';
+        ctx.lineWidth = 2.4;
+        ctx.setLineDash([8, 5]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Waypoint markers along track
+        trackPoints.forEach((pt, i) => {
+          if (pt.eye_u < 0 || pt.eye_u > 1 || pt.eye_v < 0 || pt.eye_v > 1) return;
+          const pr = Math.min(rows - 1, Math.max(0, Math.floor(pt.eye_v * rows)));
+          const pc = Math.min(cols - 1, Math.max(0, Math.floor(pt.eye_u * cols)));
+          const gE = (elevGrid[pr]?.[pc] ?? minElev) + 2.0;
+          const ptScreen = project(pt.eye_u, pt.eye_v, gE);
+          ctx.beginPath();
+          ctx.arc(ptScreen.x, ptScreen.y, i === 0 || i === trackPoints.length - 1 ? 4.5 : 3.0, 0, Math.PI * 2);
+          ctx.fillStyle = '#facc15';
+          ctx.fill();
+        });
+      }
+
+      // 2. Parabolic Upper Atmospheric Cloud Canopy & Eyewall Stadium Funnel
+      const canopyRadiusNorm = Math.max(0.42, Math.min(0.85, (stormRadiusKm / 180) * 0.58));
+      const eyeRadiusNorm = Math.max(0.035, Math.min(0.12, (rMaxKm / 45) * 0.065));
+      const canopyTopAlt = vortexAltitude + 16.0;
+
+      // Draw multi-tier rotating translucent cloud canopy discs
+      const numTiers = 4;
+      for (let tier = 0; tier < numTiers; tier++) {
+        const tierFrac = (tier + 1) / numTiers;
+        const tierRadius = eyeRadiusNorm + tierFrac * (canopyRadiusNorm - eyeRadiusNorm);
+        const tierAlt = vortexAltitude + tierFrac * 12.0;
+        ctx.beginPath();
+        let ringStarted = false;
+        const numRingSteps = 32;
+        for (let s = 0; s <= numRingSteps; s++) {
+          const ringAngle = (s / numRingSteps) * Math.PI * 2 + (physicsEnabled ? wavePhase * (1.2 - tierFrac * 0.6) : 0);
+          const ru = eyeU + Math.cos(ringAngle) * tierRadius;
+          const rv = eyeV + Math.sin(ringAngle) * tierRadius;
+          const rpt = project(ru, rv, tierAlt + Math.sin(s * 0.6 + wavePhase * 2) * 1.5);
+          if (!ringStarted) {
+            ctx.moveTo(rpt.x, rpt.y);
+            ringStarted = true;
+          } else {
+            ctx.lineTo(rpt.x, rpt.y);
+          }
+        }
+        ctx.strokeStyle = `rgba(240, 249, 255, ${0.18 - tier * 0.03})`;
+        ctx.lineWidth = 2.5 + tier * 1.5;
+        ctx.stroke();
+      }
+
+      // 3. Eyewall Stadium Effect: Vertical sloping stadium ribs connecting ground to cloud ceiling
+      const numStadiumRibs = 16;
+      for (let sr = 0; sr < numStadiumRibs; sr++) {
+        const ribAngle = (sr / numStadiumRibs) * Math.PI * 2 + (physicsEnabled ? wavePhase * 2.8 : 0);
+        const groundU = eyeU + Math.cos(ribAngle) * eyeRadiusNorm;
+        const groundV = eyeV + Math.sin(ribAngle) * eyeRadiusNorm;
+        const canopyU = eyeU + Math.cos(ribAngle) * (eyeRadiusNorm * 1.6);
+        const canopyV = eyeV + Math.sin(ribAngle) * (eyeRadiusNorm * 1.6);
+
+        const rRow = Math.min(rows - 1, Math.max(0, Math.floor(groundV * rows)));
+        const rCol = Math.min(cols - 1, Math.max(0, Math.floor(groundU * cols)));
+        const groundE = (elevGrid[rRow]?.[rCol] ?? minElev) + 1.0;
+
+        const pGround = project(groundU, groundV, groundE);
+        const pCanopy = project(canopyU, canopyV, canopyTopAlt);
+
+        ctx.beginPath();
+        ctx.moveTo(pGround.x, pGround.y);
+        ctx.lineTo(pCanopy.x, pCanopy.y);
+        ctx.strokeStyle = 'rgba(239, 68, 68, 0.45)';
+        ctx.lineWidth = 1.4;
+        ctx.stroke();
+      }
+
+      // 4. Rotating Logarithmic Spiral Rainbands with Convective Cloud Puffs
+      const numArms = 8;
+      const bLog = 0.22;
       for (let a = 0; a < numArms; a++) {
         const baseAngle = (a / numArms) * Math.PI * 2;
-        const currentRot = baseAngle + (physicsEnabled ? wavePhase * 2.4 : 0);
+        const currentRot = baseAngle + (physicsEnabled ? wavePhase * 2.8 : 0);
 
         ctx.beginPath();
         let started = false;
-        for (let step = 0; step < 24; step++) {
-          const t = step / 24;
-          const rad = 0.04 + t * maxRadius;
-          const angle = currentRot + t * Math.PI * 1.8;
+        for (let step = 0; step < 28; step++) {
+          const t = step / 28;
+          const rad = eyeRadiusNorm * Math.exp(bLog * t * Math.PI * 2.4);
+          if (rad > canopyRadiusNorm) break;
+          const angle = currentRot + t * Math.PI * 2.2;
           const su = eyeU + Math.cos(angle) * rad;
           const sv = eyeV + Math.sin(angle) * rad;
-          if (su < 0 || su > 1 || sv < 0 || sv > 1) continue;
-          const sAlt = vortexAltitude + Math.sin(t * Math.PI) * 4.0;
+          if (su < -0.15 || su > 1.15 || sv < -0.15 || sv > 1.15) continue;
+          const sAlt = vortexAltitude + Math.sin(t * Math.PI) * 5.0 + Math.cos(step * 0.4 + wavePhase) * 1.2;
           const spt = project(su, sv, sAlt);
           if (!started) {
             ctx.moveTo(spt.x, spt.y);
@@ -1108,21 +1551,255 @@ export default function Terrain3DViewer({
           } else {
             ctx.lineTo(spt.x, spt.y);
           }
+
+          // Convective cloud puff along outer spiral arms
+          if (step % 7 === 0 && step > 7) {
+            ctx.arc(spt.x, spt.y, 4.0 + (step / 28) * 6.0, 0, Math.PI * 2);
+          }
         }
-        ctx.strokeStyle = a % 2 === 0 ? 'rgba(6, 182, 212, 0.75)' : 'rgba(168, 85, 247, 0.65)';
-        ctx.lineWidth = 1.8;
-        ctx.setLineDash([8, 6]);
+        ctx.strokeStyle = a % 2 === 0 ? 'rgba(56, 189, 248, 0.85)' : 'rgba(192, 132, 252, 0.75)';
+        ctx.lineWidth = a % 2 === 0 ? 2.4 : 1.8;
+        ctx.setLineDash([10, 6]);
         ctx.stroke();
         ctx.setLineDash([]);
       }
 
-      // Cyclone Eye Ring
-      const eyePt = project(eyeU, eyeV, vortexAltitude + 2);
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.8)';
-      ctx.lineWidth = 2.0;
+      // 5. Cyclone Eye Wall (Glowing Concentric Rings & Calm Eye)
+      const eyePt = project(eyeU, eyeV, vortexAltitude + 3);
+      const eyeScreenRadius = Math.max(12, Math.min(32, (rMaxKm / 35) * 18));
+
+      // Outer eyewall neon halo
       ctx.beginPath();
-      ctx.arc(eyePt.x, eyePt.y, 8, 0, Math.PI * 2);
+      ctx.arc(eyePt.x, eyePt.y, eyeScreenRadius * 1.15, 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(239, 68, 68, 0.35)';
+      ctx.lineWidth = 6.0;
       ctx.stroke();
+
+      // Outer violent eyewall
+      ctx.beginPath();
+      ctx.arc(eyePt.x, eyePt.y, eyeScreenRadius, 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(239, 68, 68, 0.95)';
+      ctx.lineWidth = 2.8;
+      ctx.stroke();
+
+      // Inner calm eye ring
+      ctx.beginPath();
+      ctx.arc(eyePt.x, eyePt.y, Math.max(5, eyeScreenRadius * 0.45), 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.95)';
+      ctx.lineWidth = 2.0;
+      ctx.fillStyle = 'rgba(15, 23, 42, 0.65)';
+      ctx.fill();
+      ctx.stroke();
+
+      // 6. Floating 3D Tactical Cyclone Tracker HUD Badge
+      const hudPt = project(eyeU, eyeV, vortexAltitude + 8);
+      const catShort = category.includes('Category') ? category.split(' ')[0] + ' ' + category.split(' ')[1] : category;
+      const pcVal = meta.central_pressure_hpa ? Math.round(meta.central_pressure_hpa) : 945;
+      const surgeVal = meta.estimated_coastal_surge_m ? Number(meta.estimated_coastal_surge_m).toFixed(1) : '2.5';
+      const line1 = `🌀 ${catShort} • ${Math.round(curWindKmh)} km/h • ${pcVal} hPa`;
+      const line2 = `Rmax ${Math.round(rMaxKm)}km • Heading ${Math.round(dirDeg)}° • Surge +${surgeVal}m`;
+
+      ctx.font = '700 11px "JetBrains Mono", monospace';
+      const w1 = ctx.measureText(line1).width;
+      ctx.font = '500 9.5px "JetBrains Mono", monospace';
+      const w2 = ctx.measureText(line2).width;
+      const maxW = Math.max(w1, w2);
+
+      const padX = 10;
+      const boxW = maxW + padX * 2;
+      const boxH = 34;
+      const boxX = hudPt.x - boxW / 2;
+      const boxY = hudPt.y - boxH - 8;
+
+      ctx.fillStyle = 'rgba(11, 19, 32, 0.94)';
+      ctx.strokeStyle = curWindKmh >= 209 ? '#f43f5e' : curWindKmh >= 154 ? '#fb923c' : '#38bdf8';
+      ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      ctx.roundRect(boxX, boxY, boxW, boxH, 6);
+      ctx.fill();
+      ctx.stroke();
+
+      // Line 1: Category & Wind
+      ctx.font = '700 11px "JetBrains Mono", monospace';
+      ctx.fillStyle = curWindKmh >= 209 ? '#f43f5e' : curWindKmh >= 154 ? '#fb923c' : '#38bdf8';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      ctx.fillText(line1, hudPt.x, boxY + 4);
+
+      // Line 2: Details
+      ctx.font = '500 9.5px "JetBrains Mono", monospace';
+      ctx.fillStyle = '#94a3b8';
+      ctx.fillText(line2, hudPt.x, boxY + 18);
+
+      ctx.restore();
+    }
+
+    // ─── WILDFIRE: Dynamic 3D Ignition Beacon, Downwind Smoke Plumes & Wind Vector HUD ───
+    if (hazardType === 'wildfire') {
+      const b = result.bbox;
+      const latSpan = Math.max(0.001, b.north - b.south);
+      const lonSpan = Math.max(0.001, b.east - b.west);
+
+      const ignLat = Number(wfSimMeta.ignition_lat ?? (b.north + b.south) / 2);
+      const ignLon = Number(wfSimMeta.ignition_lon ?? (b.east + b.west) / 2);
+      const initRadiusM = Number(wfSimMeta.initial_fire_radius_m ?? 10);
+      const fuelTypeStr = String(wfSimMeta.fuel_type || 'grass').toUpperCase();
+      const fireDanger = String(wfSimMeta.fire_danger_rating || 'HIGH');
+
+      const ignU = (ignLon - b.west) / lonSpan;
+      const ignV = (b.north - ignLat) / latSpan;
+
+      const clampIgnR = Math.min(rows - 1, Math.max(0, Math.floor(ignV * rows)));
+      const clampIgnC = Math.min(cols - 1, Math.max(0, Math.floor(ignU * cols)));
+      const ignGroundE = elevGrid[clampIgnR]?.[clampIgnC] ?? minElev;
+
+      ctx.save();
+
+      // 1. 3D Pulsating Ignition Source Beacon at (ignU, ignV)
+      if (ignU >= -0.1 && ignU <= 1.1 && ignV >= -0.1 && ignV <= 1.1) {
+        // Base concentric footprint rings on ground
+        const numRings = 3;
+        for (let ring = 0; ring < numRings; ring++) {
+          const ringRad = 0.015 + ring * 0.012 + (physicsEnabled ? Math.sin(wavePhase * 3.0 + ring) * 0.004 : 0);
+          ctx.beginPath();
+          for (let step = 0; step <= 24; step++) {
+            const a = (step / 24) * Math.PI * 2;
+            const ru = ignU + Math.cos(a) * ringRad;
+            const rv = ignV + Math.sin(a) * ringRad;
+            const rpt = project(ru, rv, ignGroundE + 0.3);
+            if (step === 0) ctx.moveTo(rpt.x, rpt.y);
+            else ctx.lineTo(rpt.x, rpt.y);
+          }
+          ctx.closePath();
+          ctx.strokeStyle = ring === 0 ? 'rgba(254, 240, 138, 0.9)' : 'rgba(249, 115, 22, 0.6)';
+          ctx.lineWidth = ring === 0 ? 2.0 : 1.2;
+          ctx.stroke();
+        }
+
+        // Vertical Laser Beacon Spire shooting into the sky
+        const beaconTopH = ignGroundE + 24.0;
+        const pBase = project(ignU, ignV, ignGroundE + 0.2);
+        const pTop = project(ignU, ignV, beaconTopH);
+
+        const beaconGrad = ctx.createLinearGradient(pBase.x, pBase.y, pTop.x, pTop.y);
+        beaconGrad.addColorStop(0, 'rgba(254, 240, 138, 0.95)');
+        beaconGrad.addColorStop(0.3, 'rgba(249, 115, 22, 0.7)');
+        beaconGrad.addColorStop(1, 'rgba(220, 38, 38, 0.1)');
+
+        ctx.strokeStyle = beaconGrad;
+        ctx.lineWidth = 3.2;
+        ctx.beginPath();
+        ctx.moveTo(pBase.x, pBase.y);
+        ctx.lineTo(pTop.x, pTop.y);
+        ctx.stroke();
+
+        // Pulsing Beacon Orb atop the beam
+        const orbRadius = 5.0 + (physicsEnabled ? Math.sin(wavePhase * 5.0) * 1.5 : 0);
+        ctx.beginPath();
+        ctx.arc(pTop.x, pTop.y, orbRadius, 0, Math.PI * 2);
+        ctx.fillStyle = '#fef08a';
+        ctx.fill();
+
+        // Tactical 3D HUD Tag for Ignition Origin
+        const hudX = pTop.x;
+        const hudY = pTop.y - 14;
+        const ignLabel = `📍 IGNITION SOURCE: ${ignLat.toFixed(3)}°N, ${ignLon.toFixed(3)}°E (R=${initRadiusM}m)`;
+        ctx.font = '700 9.5px "JetBrains Mono", monospace';
+        const ignTextW = ctx.measureText(ignLabel).width;
+        ctx.fillStyle = 'rgba(15, 23, 42, 0.88)';
+        ctx.fillRect(hudX - ignTextW / 2 - 6, hudY - 9, ignTextW + 12, 18);
+        ctx.strokeStyle = '#f97316';
+        ctx.lineWidth = 1.0;
+        ctx.strokeRect(hudX - ignTextW / 2 - 6, hudY - 9, ignTextW + 12, 18);
+        ctx.fillStyle = '#fef08a';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(ignLabel, hudX, hudY);
+      }
+
+      // 2. Volumetric Downwind Smoke Plumes billowing from active fire
+      if (physicsEnabled) {
+        const activeFireCells: Array<{ u: number; v: number; e: number; norm: number }> = [];
+        for (let r = 0; r < rows; r += 2) {
+          for (let c = 0; c < cols; c += 2) {
+            const vVal = currentHazardGrid[r]?.[c] ?? 0;
+            if (vVal > 0.25) {
+              const uC = (c + 0.5) / cols;
+              const vC = (r + 0.5) / rows;
+              const gE = elevGrid[r]?.[c] ?? minElev;
+              activeFireCells.push({ u: uC, v: vC, e: gE, norm: Math.min(1.0, vVal) });
+            }
+          }
+        }
+
+        // Limit to 18 plumes for buttery 60fps performance
+        const sampledCells = activeFireCells.slice(0, 18);
+        sampledCells.forEach((cell, idx) => {
+          const numParticles = 4;
+          for (let p = 1; p <= numParticles; p++) {
+            const driftDist = (p * 0.032) * (wfWindSpeed / 30);
+            const liftDist = p * 2.8;
+            const puffU = cell.u + wfDownwindU * driftDist + Math.sin(wavePhase * 2.0 + idx + p) * 0.008;
+            const puffV = cell.v + wfDownwindV * driftDist + Math.cos(wavePhase * 2.0 + idx + p) * 0.008;
+            const puffPt = project(puffU, puffV, cell.e + liftDist);
+
+            const puffRadius = Math.max(3, 4 + p * 3.5);
+            const puffAlpha = Math.max(0.04, (1.0 - p / (numParticles + 1)) * 0.35 * cell.norm);
+
+            ctx.beginPath();
+            ctx.arc(puffPt.x, puffPt.y, puffRadius, 0, Math.PI * 2);
+            ctx.fillStyle = `rgba(51, 65, 85, ${puffAlpha.toFixed(2)})`;
+            ctx.fill();
+          }
+        });
+      }
+
+      // 3. Floating 3D Wind Vector Compass & Fire Telemetry HUD
+      {
+        const hudAnchorU = 0.14;
+        const hudAnchorV = 0.14;
+        const hudAlt = maxElev + 8.0;
+        const anchorPt = project(hudAnchorU, hudAnchorV, hudAlt);
+
+        // Vector arrow end in downwind direction
+        const arrowDist = 0.12 * Math.min(1.5, Math.max(0.6, wfWindSpeed / 25));
+        const arrowTipU = hudAnchorU + wfDownwindU * arrowDist;
+        const arrowTipV = hudAnchorV + wfDownwindV * arrowDist;
+        const arrowTipPt = project(arrowTipU, arrowTipV, hudAlt);
+
+        // Draw 3D Wind Vector Shaft
+        ctx.beginPath();
+        ctx.moveTo(anchorPt.x, anchorPt.y);
+        ctx.lineTo(arrowTipPt.x, arrowTipPt.y);
+        ctx.strokeStyle = '#38bdf8';
+        ctx.lineWidth = 2.8;
+        ctx.stroke();
+
+        // Wind Arrowhead
+        const arrAngle = Math.atan2(arrowTipPt.y - anchorPt.y, arrowTipPt.x - anchorPt.x);
+        ctx.beginPath();
+        ctx.moveTo(arrowTipPt.x, arrowTipPt.y);
+        ctx.lineTo(arrowTipPt.x - Math.cos(arrAngle - 0.45) * 10, arrowTipPt.y - Math.sin(arrAngle - 0.45) * 10);
+        ctx.lineTo(arrowTipPt.x - Math.cos(arrAngle + 0.45) * 10, arrowTipPt.y - Math.sin(arrAngle + 0.45) * 10);
+        ctx.closePath();
+        ctx.fillStyle = '#38bdf8';
+        ctx.fill();
+
+        // Telemetry HUD Card
+        const windLabel = `🌬️ WIND: ${wfWindSpeed} km/h • ${wfWindDir}° [${fuelTypeStr} • ${fireDanger}]`;
+        ctx.font = '700 9px "JetBrains Mono", monospace';
+        const windTextW = ctx.measureText(windLabel).width;
+        ctx.fillStyle = 'rgba(10, 15, 29, 0.88)';
+        ctx.fillRect(anchorPt.x - 10, anchorPt.y - 18, windTextW + 16, 16);
+        ctx.strokeStyle = '#38bdf8';
+        ctx.lineWidth = 0.8;
+        ctx.strokeRect(anchorPt.x - 10, anchorPt.y - 18, windTextW + 16, 16);
+        ctx.fillStyle = '#38bdf8';
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(windLabel, anchorPt.x - 2, anchorPt.y - 10);
+      }
+
       ctx.restore();
     }
 
@@ -1195,7 +1872,7 @@ export default function Terrain3DViewer({
     }
 
     // ─── Render 3D Buildings with Hazard-Specific Damage & Physics ───
-    {
+    if (showBuildings) {
       const b = result.bbox;
       const latSpan = Math.max(0.001, b.north - b.south);
       const lonSpan = Math.max(0.001, b.east - b.west);
@@ -1299,6 +1976,220 @@ export default function Terrain3DViewer({
         }
       });
     }
+
+    // ─── Render Hovered Tile Subtle Highlight ───
+    if (hoveredTile && (!selectedTile || hoveredTile.r !== selectedTile.r || hoveredTile.c !== selectedTile.c)) {
+      const hr = hoveredTile.r;
+      const hc = hoveredTile.c;
+      if (hr >= 0 && hr < rows - 1 && hc >= 0 && hc < cols - 1) {
+        const u0 = hc / (cols - 1);
+        const u1 = (hc + 1) / (cols - 1);
+        const v0 = hr / (rows - 1);
+        const v1 = (hr + 1) / (rows - 1);
+        const e00 = elevGrid[hr]?.[hc] ?? minElev;
+        const e10 = elevGrid[hr]?.[hc + 1] ?? minElev;
+        const e11 = elevGrid[hr + 1]?.[hc + 1] ?? minElev;
+        const e01 = elevGrid[hr + 1]?.[hc] ?? minElev;
+        const hp00 = project(u0, v0, e00);
+        const hp10 = project(u1, v0, e10);
+        const hp11 = project(u1, v1, e11);
+        const hp01 = project(u0, v1, e01);
+
+        ctx.save();
+        ctx.beginPath();
+        ctx.moveTo(hp00.x, hp00.y);
+        ctx.lineTo(hp10.x, hp10.y);
+        ctx.lineTo(hp11.x, hp11.y);
+        ctx.lineTo(hp01.x, hp01.y);
+        ctx.closePath();
+        ctx.fillStyle = 'rgba(56, 189, 248, 0.12)';
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(56, 189, 248, 0.65)';
+        ctx.lineWidth = 1.2;
+        ctx.setLineDash([4, 3]);
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+
+    // ─── Render Selected Tile with Floating Satellite Imagery Above It ───
+    if (selectedTile) {
+      const { r, c } = selectedTile;
+      if (r >= 0 && r < rows - 1 && c >= 0 && c < cols - 1) {
+        const u0 = c / (cols - 1);
+        const u1 = (c + 1) / (cols - 1);
+        const v0 = r / (rows - 1);
+        const v1 = (r + 1) / (rows - 1);
+        const uMid = (u0 + u1) / 2;
+        const vMid = (v0 + v1) / 2;
+
+        const e00 = elevGrid[r]?.[c] ?? minElev;
+        const e10 = elevGrid[r]?.[c + 1] ?? minElev;
+        const e11 = elevGrid[r + 1]?.[c + 1] ?? minElev;
+        const e01 = elevGrid[r + 1]?.[c] ?? minElev;
+        const avgElev = (e00 + e10 + e11 + e01) / 4;
+
+        // Ground terrain points
+        const gp00 = project(u0, v0, e00);
+        const gp10 = project(u1, v0, e10);
+        const gp11 = project(u1, v1, e11);
+        const gp01 = project(u0, v1, e01);
+        const gpMid = project(uMid, vMid, avgElev);
+
+        // Elevated floating satellite plane points
+        const floatElev = avgElev + satelliteHeight;
+        const fp00 = project(u0, v0, floatElev);
+        const fp10 = project(u1, v0, floatElev);
+        const fp11 = project(u1, v1, floatElev);
+        const fp01 = project(u0, v1, floatElev);
+        const fpMid = project(uMid, vMid, floatElev);
+
+        ctx.save();
+
+        // 1. Ground Footprint highlight
+        ctx.beginPath();
+        ctx.moveTo(gp00.x, gp00.y);
+        ctx.lineTo(gp10.x, gp10.y);
+        ctx.lineTo(gp11.x, gp11.y);
+        ctx.lineTo(gp01.x, gp01.y);
+        ctx.closePath();
+        ctx.fillStyle = 'rgba(56, 189, 248, 0.22)';
+        ctx.fill();
+        ctx.strokeStyle = '#38bdf8';
+        ctx.lineWidth = 2.2;
+        ctx.stroke();
+
+        // 2. Translucent vertical holographic laser volume / pillars
+        ctx.fillStyle = 'rgba(56, 189, 248, 0.08)';
+        ctx.beginPath();
+        ctx.moveTo(gp00.x, gp00.y);
+        ctx.lineTo(fp00.x, fp00.y);
+        ctx.lineTo(fp10.x, fp10.y);
+        ctx.lineTo(gp10.x, gp10.y);
+        ctx.closePath();
+        ctx.fill();
+
+        ctx.beginPath();
+        ctx.moveTo(gp10.x, gp10.y);
+        ctx.lineTo(fp10.x, fp10.y);
+        ctx.lineTo(fp11.x, fp11.y);
+        ctx.lineTo(gp11.x, gp11.y);
+        ctx.closePath();
+        ctx.fill();
+
+        ctx.beginPath();
+        ctx.moveTo(gp11.x, gp11.y);
+        ctx.lineTo(fp11.x, fp11.y);
+        ctx.lineTo(fp01.x, fp01.y);
+        ctx.lineTo(gp01.x, gp01.y);
+        ctx.closePath();
+        ctx.fill();
+
+        ctx.beginPath();
+        ctx.moveTo(gp01.x, gp01.y);
+        ctx.lineTo(fp01.x, fp01.y);
+        ctx.lineTo(fp00.x, fp00.y);
+        ctx.lineTo(gp00.x, gp00.y);
+        ctx.closePath();
+        ctx.fill();
+
+        // Vertical corner tethers with glowing cyan dashed laser lines
+        ctx.strokeStyle = 'rgba(56, 189, 248, 0.9)';
+        ctx.lineWidth = 1.6;
+        ctx.setLineDash([5, 4]);
+        [
+          [gp00, fp00],
+          [gp10, fp10],
+          [gp11, fp11],
+          [gp01, fp01],
+        ].forEach(([g, f]) => {
+          ctx.beginPath();
+          ctx.moveTo(g.x, g.y);
+          ctx.lineTo(f.x, f.y);
+          ctx.stroke();
+        });
+
+        // Center vertical tether
+        ctx.strokeStyle = 'rgba(34, 211, 238, 0.75)';
+        ctx.lineWidth = 1.2;
+        ctx.beginPath();
+        ctx.moveTo(gpMid.x, gpMid.y);
+        ctx.lineTo(fpMid.x, fpMid.y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // 3. Floating 3D Satellite Plane
+        ctx.beginPath();
+        ctx.moveTo(fp00.x, fp00.y);
+        ctx.lineTo(fp10.x, fp10.y);
+        ctx.lineTo(fp11.x, fp11.y);
+        ctx.lineTo(fp01.x, fp01.y);
+        ctx.closePath();
+        ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
+        ctx.fill();
+
+        // Texture map satellite image if loaded
+        if (aoiSatImg && aoiSatImg.complete && aoiSatImg.naturalWidth > 0) {
+          drawTexturedQuad(ctx, aoiSatImg, fp00, fp10, fp11, fp01, u0, v0, u1, v1);
+        }
+
+        // Floating plane glowing border & corner reticles
+        ctx.strokeStyle = '#38bdf8';
+        ctx.lineWidth = 2.4;
+        ctx.beginPath();
+        ctx.moveTo(fp00.x, fp00.y);
+        ctx.lineTo(fp10.x, fp10.y);
+        ctx.lineTo(fp11.x, fp11.y);
+        ctx.lineTo(fp01.x, fp01.y);
+        ctx.closePath();
+        ctx.stroke();
+
+        // Corner crosshair brackets
+        [fp00, fp10, fp11, fp01].forEach((p) => {
+          ctx.fillStyle = '#38bdf8';
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, 3.5, 0, Math.PI * 2);
+          ctx.fill();
+        });
+
+        // Altitude indicator badge on center tether
+        const midTetherX = (gpMid.x + fpMid.x) / 2;
+        const midTetherY = (gpMid.y + fpMid.y) / 2;
+        const altText = `▲ +${Math.round(satelliteHeight)}m ALTITUDE`;
+        ctx.font = '700 9.5px "JetBrains Mono", monospace';
+        const altW = ctx.measureText(altText).width;
+        ctx.fillStyle = 'rgba(11, 19, 32, 0.9)';
+        ctx.fillRect(midTetherX + 6, midTetherY - 8, altW + 10, 16);
+        ctx.strokeStyle = '#38bdf8';
+        ctx.lineWidth = 1.0;
+        ctx.strokeRect(midTetherX + 6, midTetherY - 8, altW + 10, 16);
+        ctx.fillStyle = '#38bdf8';
+        ctx.fillText(altText, midTetherX + 11, midTetherY + 4);
+
+        ctx.restore();
+
+        // Holographic tracker beam connecting 3D floating satellite to side inspection card
+        const sideTargetX = width - 340;
+        const sideTargetY = 95;
+        if (sideTargetX > fpMid.x + 30) {
+          ctx.save();
+          ctx.strokeStyle = 'rgba(56, 189, 248, 0.4)';
+          ctx.lineWidth = 1.0;
+          ctx.setLineDash([4, 4]);
+          ctx.beginPath();
+          ctx.moveTo(fpMid.x, fpMid.y);
+          ctx.lineTo(sideTargetX, sideTargetY);
+          ctx.stroke();
+
+          // Radar connector point
+          ctx.fillStyle = '#38bdf8';
+          ctx.beginPath();
+          ctx.arc(sideTargetX, sideTargetY, 3, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.restore();
+        }
+      }
+    }
   }, [
     yaw,
     pitch,
@@ -1319,15 +2210,34 @@ export default function Terrain3DViewer({
     hazardType,
     peakVal,
     tileNumberMode,
+    selectedTile,
+    hoveredTile,
+    satelliteHeight,
+    renderNonce,
+    aoiSatImg,
+    showBuildings,
   ]);
 
-  // Non-passive wheel listener: smooth exponential zoom
+  // Non-passive wheel listener: smooth, responsive exponential zoom across all mouse/trackpad modes
   useEffect(() => {
     const el = viewportRef.current;
     if (!el) return;
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
-      setZoom((prev) => Math.max(0.5, Math.min(4.0, prev * Math.exp(-e.deltaY * 0.0012))));
+      // Normalize wheel delta across pixel/line/page modes
+      let dy = e.deltaY;
+      if (e.deltaMode === 1) dy *= 33; // Line mode (Firefox / Windows wheel settings)
+      else if (e.deltaMode === 2) dy *= 100; // Page mode
+
+      // Responsive zoom calculation
+      const zoomFactor = dy < 0 ? 1.15 : 0.87;
+      setZoom((prev) => {
+        if (Math.abs(dy) < 50) {
+          // Trackpads or fine scroll gestures
+          return Math.max(0.6, Math.min(6.5, +(prev * Math.exp(-dy * 0.003)).toFixed(3)));
+        }
+        return Math.max(0.6, Math.min(6.5, +(prev * zoomFactor).toFixed(2)));
+      });
     };
     el.addEventListener('wheel', onWheel, { passive: false });
     return () => el.removeEventListener('wheel', onWheel);
@@ -1339,27 +2249,92 @@ export default function Terrain3DViewer({
     setPitch((prev) => (prev + dy * 0.5 + 360) % 360);
   };
 
-  // Mouse drag to orbit (only when dragging on the canvas/viewport itself)
+  // Mouse drag to orbit (left click) or slide to zoom (right click, middle click, or Shift+drag)
   const handleMouseDown = (e: React.MouseEvent) => {
     const target = e.target as HTMLElement | null;
     if (
       target?.closest(
-        'input, button, .terrain3d-floating-timeline, .terrain3d-height-float, .terrain3d-zoombar, .terrain3d-actions'
+        'input, button, .terrain3d-floating-timeline, .terrain3d-height-float, .terrain3d-zoombar, .terrain3d-actions, .terrain3d-floating-sat-card'
       )
     ) {
       return;
     }
+    // Right click (2), middle click (1), or Shift/Alt + click = mouse zoom slide!
+    const isZoom = e.button === 2 || e.button === 1 || (e.button === 0 && (e.shiftKey || e.altKey));
+    dragModeRef.current = isZoom ? 'zoom' : 'orbit';
+
     setIsDragging(true);
     draggingRef.current = true;
+    dragStartPos.current = { x: e.clientX, y: e.clientY };
+    hasMovedDrag.current = false;
     lastMousePos.current = { x: e.clientX, y: e.clientY };
   };
 
   const handleMouseMove = (e: React.MouseEvent) => {
-    if (!draggingRef.current) return;
-    const dx = e.clientX - lastMousePos.current.x;
-    const dy = e.clientY - lastMousePos.current.y;
-    lastMousePos.current = { x: e.clientX, y: e.clientY };
-    orbitBy(dx, dy);
+    if (draggingRef.current) {
+      const dist = Math.hypot(e.clientX - dragStartPos.current.x, e.clientY - dragStartPos.current.y);
+      if (dist > 5) {
+        hasMovedDrag.current = true;
+      }
+      const dx = e.clientX - lastMousePos.current.x;
+      const dy = e.clientY - lastMousePos.current.y;
+      lastMousePos.current = { x: e.clientX, y: e.clientY };
+
+      if (dragModeRef.current === 'zoom') {
+        // Slide mouse vertically: moving up zooms in, moving down zooms out
+        const zoomStep = Math.exp(-dy * 0.012);
+        setZoom((prev) => Math.max(0.6, Math.min(6.5, +(prev * zoomStep).toFixed(2))));
+      } else {
+        orbitBy(dx, dy);
+      }
+    } else {
+      // Check hover over 3D tiles for interactive cursor and preview outline
+      const canvas = canvasRef.current;
+      if (canvas && screenQuadsRef.current.length > 0) {
+        const rect = canvas.getBoundingClientRect();
+        const mx = e.clientX - rect.left;
+        const my = e.clientY - rect.top;
+        let found: { r: number; c: number } | null = null;
+        for (const q of screenQuadsRef.current) {
+          if (isPointInQuad(mx, my, q.p00, q.p10, q.p11, q.p01)) {
+            found = { r: q.r, c: q.c };
+            break;
+          }
+        }
+        setHoveredTile(found);
+      }
+    }
+  };
+
+  // Canvas click handler: selects clicked tile and activates floating satellite
+  const handleCanvasClick = (e: React.MouseEvent) => {
+    if (hasMovedDrag.current) return;
+    const target = e.target as HTMLElement | null;
+    if (
+      target?.closest(
+        'input, button, .terrain3d-floating-timeline, .terrain3d-height-float, .terrain3d-zoombar, .terrain3d-actions, .terrain3d-floating-sat-card'
+      )
+    ) {
+      return;
+    }
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const clickX = e.clientX - rect.left;
+    const clickY = e.clientY - rect.top;
+
+    for (const q of screenQuadsRef.current) {
+      if (isPointInQuad(clickX, clickY, q.p00, q.p10, q.p11, q.p01)) {
+        if (selectedTile && selectedTile.r === q.r && selectedTile.c === q.c) {
+          setSelectedTile(null);
+        } else {
+          setSelectedTile({ r: q.r, c: q.c });
+        }
+        return;
+      }
+    }
+    // Clicked outside terrain quads
+    setSelectedTile(null);
   };
 
   const endDrag = () => {
@@ -1373,7 +2348,7 @@ export default function Terrain3DViewer({
     const target = e.target as HTMLElement | null;
     if (
       target?.closest(
-        'input, button, .terrain3d-floating-timeline, .terrain3d-height-float, .terrain3d-zoombar, .terrain3d-actions'
+        'input, button, .terrain3d-floating-timeline, .terrain3d-height-float, .terrain3d-zoombar, .terrain3d-actions, .terrain3d-floating-sat-card'
       )
     ) {
       return;
@@ -1388,6 +2363,8 @@ export default function Terrain3DViewer({
     } else if (e.touches.length === 1) {
       setIsDragging(true);
       draggingRef.current = true;
+      dragStartPos.current = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+      hasMovedDrag.current = false;
       lastMousePos.current = { x: e.touches[0].clientX, y: e.touches[0].clientY };
     }
   };
@@ -1404,11 +2381,31 @@ export default function Terrain3DViewer({
       }
       pinchRef.current = d;
     } else if (e.touches.length === 1 && draggingRef.current) {
+      const dist = Math.hypot(e.touches[0].clientX - dragStartPos.current.x, e.touches[0].clientY - dragStartPos.current.y);
+      if (dist > 5) {
+        hasMovedDrag.current = true;
+      }
       const dx = e.touches[0].clientX - lastMousePos.current.x;
       const dy = e.touches[0].clientY - lastMousePos.current.y;
       lastMousePos.current = { x: e.touches[0].clientX, y: e.touches[0].clientY };
       orbitBy(dx, dy);
     }
+  };
+
+  const handleTouchEnd = (e: React.TouchEvent) => {
+    if (!hasMovedDrag.current && e.changedTouches.length === 1 && canvasRef.current) {
+      const touch = e.changedTouches[0];
+      const rect = canvasRef.current.getBoundingClientRect();
+      const clickX = touch.clientX - rect.left;
+      const clickY = touch.clientY - rect.top;
+      for (const q of screenQuadsRef.current) {
+        if (isPointInQuad(clickX, clickY, q.p00, q.p10, q.p11, q.p01)) {
+          setSelectedTile({ r: q.r, c: q.c });
+          break;
+        }
+      }
+    }
+    endDrag();
   };
 
   // Keyboard orbit + zoom
@@ -1418,8 +2415,8 @@ export default function Terrain3DViewer({
     else if (e.key === 'ArrowRight') setYaw((p) => (p + step) % 360);
     else if (e.key === 'ArrowUp') setPitch((p) => (p + step) % 360);
     else if (e.key === 'ArrowDown') setPitch((p) => (p - step + 360) % 360);
-    else if (e.key === '+' || e.key === '=') setZoom((z) => Math.min(4.0, z * 1.12));
-    else if (e.key === '-' || e.key === '_') setZoom((z) => Math.max(0.5, z / 1.12));
+    else if (e.key === '+' || e.key === '=') setZoom((z) => Math.min(6.5, z * 1.12));
+    else if (e.key === '-' || e.key === '_') setZoom((z) => Math.max(0.6, z / 1.12));
     else return;
     e.preventDefault();
   };
@@ -1431,7 +2428,7 @@ export default function Terrain3DViewer({
     if (timeUnit === 'minutes' || timeUnit === 'min') {
       const m = Math.floor(val);
       const s = Math.round((val - m) * 60);
-      return s > 0 ? `${m}m ${s}s` : `${m} min`;
+      return `${m}m ${s.toString().padStart(2, '0')}s`;
     }
     const totalMinutes = Math.round(val * 60);
     const hrs = Math.floor(totalMinutes / 60);
@@ -1440,6 +2437,38 @@ export default function Terrain3DViewer({
   };
 
   const currentSimTime = (animFrame / Math.max(1, totalFrames - 1)) * totalSimulationTime;
+
+  const formatTickLabel = (val: number) => {
+    if (timeUnit === 'seconds' || timeUnit === 's') return `${Math.round(val)}s`;
+    if (timeUnit === 'minutes' || timeUnit === 'min') return `${Math.round(val)}m`;
+    const r = Math.round(val * 10) / 10;
+    return `${r % 1 === 0 ? r.toFixed(0) : r.toFixed(1)}h`;
+  };
+
+  const dynamicTicks = useMemo(() => {
+    const rawLabels = (timestepLabels && timestepLabels.length > 0)
+      ? timestepLabels
+      : sim.timesteps && sim.timesteps.length > 1
+      ? sim.timesteps.map((t) => formatTickLabel(t))
+      : null;
+
+    if (rawLabels && rawLabels.length > 0) {
+      if (rawLabels.length <= 7) return rawLabels;
+      const count = 5;
+      return Array.from({ length: count }, (_, i) => {
+        const idx = Math.round((i * (rawLabels.length - 1)) / (count - 1));
+        return rawLabels[idx];
+      });
+    }
+
+    const count = 5;
+    const ticks: string[] = [];
+    for (let i = 0; i < count; i++) {
+      const val = (totalSimulationTime * i) / (count - 1);
+      ticks.push(formatTickLabel(val));
+    }
+    return ticks;
+  }, [timestepLabels, sim.timesteps, totalSimulationTime, timeUnit]);
 
   // Dynamic labels for physics button & timeline description
   const physicsLabel = useMemo(() => {
@@ -1490,6 +2519,28 @@ export default function Terrain3DViewer({
               title="Cycle 3D tile corner micro-label: Tile # -> Elevation -> Live Hazard -> Off"
             >
               🏷️ {tileNumberMode === 'id' ? 'Tile #' : tileNumberMode === 'elev' ? 'Elev' : tileNumberMode === 'hazard' ? 'Hazard' : 'Tiles: Off'}
+            </button>
+
+            <button
+              className={`terrain3d-btn terrain3d-btn--toggle ${showBuildings ? 'terrain3d-btn--active' : ''}`}
+              onClick={() => setShowBuildings((v) => !v)}
+              title={showBuildings ? 'Hide building spires (show terrain plane only)' : 'Show 3D buildings'}
+            >
+              🏢 {showBuildings ? 'Buildings: ON' : 'Buildings: OFF'}
+            </button>
+
+            <button
+              className={`terrain3d-btn terrain3d-btn--toggle ${selectedTile ? 'terrain3d-btn--active' : ''}`}
+              onClick={() => {
+                if (selectedTile) {
+                  setSelectedTile(null);
+                } else {
+                  setSelectedTile({ r: Math.floor((rows - 1) / 2), c: Math.floor((cols - 1) / 2) });
+                }
+              }}
+              title="Select a tile & show floating satellite inspection at height"
+            >
+              🛰️ {selectedTile ? `Sat: Tile #${selectedTileData?.tileId ?? ''}` : 'Tile Satellite'}
             </button>
 
             <button
@@ -1551,11 +2602,144 @@ export default function Terrain3DViewer({
               onMouseLeave={endDrag}
               onTouchStart={handleTouchStart}
               onTouchMove={handleTouchMove}
-              onTouchEnd={endDrag}
+              onTouchEnd={handleTouchEnd}
               onKeyDown={handleKeyDown}
-              style={{ cursor: isDragging ? 'grabbing' : 'grab' }}
+              onContextMenu={(e) => e.preventDefault()}
+              style={{
+                cursor: isDragging
+                  ? dragModeRef.current === 'zoom'
+                    ? 'ns-resize'
+                    : 'grabbing'
+                  : hoveredTile
+                  ? 'pointer'
+                  : 'grab',
+              }}
             >
-              <canvas ref={canvasRef} className="terrain3d-canvas" />
+              <canvas
+                ref={canvasRef}
+                className="terrain3d-canvas"
+                onClick={handleCanvasClick}
+                onContextMenu={(e) => e.preventDefault()}
+              />
+
+              {/* Floating Satellite Aerial Recon Card */}
+              {selectedTile && selectedTileData && (
+                <div
+                  ref={floatingCardRef}
+                  className="terrain3d-floating-sat-card"
+                  onMouseDown={(e) => e.stopPropagation()}
+                  onMouseMove={(e) => e.stopPropagation()}
+                  onMouseUp={(e) => e.stopPropagation()}
+                  onTouchStart={(e) => e.stopPropagation()}
+                  onTouchMove={(e) => e.stopPropagation()}
+                >
+                  <div className="terrain3d-sat-card-header">
+                    <div className="terrain3d-sat-card-title">
+                      <span className="terrain3d-sat-card-icon">🛰️</span>
+                      <div>
+                        <div className="terrain3d-sat-card-heading">Tile #{selectedTileData.tileId} Aerial Recon</div>
+                        <div className="terrain3d-sat-card-sub">
+                          Grid [R{selectedTileData.r + 1}, C{selectedTileData.c + 1}] &bull; Hovering Satellite
+                        </div>
+                      </div>
+                    </div>
+                    <button
+                      className="terrain3d-sat-card-close"
+                      onClick={() => setSelectedTile(null)}
+                      title="Deselect tile"
+                      aria-label="Close satellite view"
+                    >
+                      ✕
+                    </button>
+                  </div>
+
+                  {/* High-res Satellite Imagery Box */}
+                  <div className="terrain3d-sat-card-img-box">
+                    <TileSatelliteCanvas
+                      aoiSatImg={aoiSatImg}
+                      selectedTileData={selectedTileData}
+                      cols={cols}
+                      rows={rows}
+                    />
+                    <div className="terrain3d-sat-badge-top-left">OPTICAL SATELLITE (0.5M)</div>
+                    <div className="terrain3d-sat-badge-top-right">
+                      +{Math.round(satelliteHeight)}m ALT
+                    </div>
+                  </div>
+
+                  {/* Fixed Satellite Altitude Info */}
+                  <div className="terrain3d-sat-card-alt-box">
+                    <div className="terrain3d-sat-alt-header">
+                      <span>🛰️ Satellite Height (Altitude):</span>
+                      <strong className="terrain3d-sat-alt-val">+85 meters</strong>
+                    </div>
+                  </div>
+
+                  {/* Tile Telemetry Info */}
+                  <div className="terrain3d-sat-card-stats">
+                    <div className="terrain3d-sat-stat-row">
+                      <span className="terrain3d-sat-stat-lbl">Elevation:</span>
+                      <span className="terrain3d-sat-stat-val">{Math.round(selectedTileData.avgElev)}m MSL</span>
+                    </div>
+                    <div className="terrain3d-sat-stat-row">
+                      <span className="terrain3d-sat-stat-lbl">Center Coordinates:</span>
+                      <span className="terrain3d-sat-stat-val">
+                        {selectedTileData.tileLat.toFixed(4)}&deg;N, {selectedTileData.tileLon.toFixed(4)}&deg;E
+                      </span>
+                    </div>
+                    <div className="terrain3d-sat-stat-row">
+                      <span className="terrain3d-sat-stat-lbl">Hazard Intensity:</span>
+                      <span
+                        className="terrain3d-sat-stat-val"
+                        style={{ color: selectedTileData.normH > 0.3 ? '#f87171' : '#38bdf8' }}
+                      >
+                        {selectedTileData.avgHazard.toFixed(2)} ({Math.round(selectedTileData.normH * 100)}%)
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Footer Navigation */}
+                  <div className="terrain3d-sat-card-nav">
+                    <button
+                      className="terrain3d-sat-nav-btn"
+                      onClick={() => {
+                        let prevC = selectedTile.c - 1;
+                        let prevR = selectedTile.r;
+                        if (prevC < 0) {
+                          prevC = cols - 2;
+                          prevR = (prevR - 1 + (rows - 1)) % (rows - 1);
+                        }
+                        setSelectedTile({ r: prevR, c: prevC });
+                      }}
+                      title="Step to previous tile"
+                    >
+                      ◀ Prev Tile
+                    </button>
+                    <button
+                      className="terrain3d-sat-nav-btn"
+                      onClick={() => {
+                        let nextC = selectedTile.c + 1;
+                        let nextR = selectedTile.r;
+                        if (nextC >= cols - 1) {
+                          nextC = 0;
+                          nextR = (nextR + 1) % (rows - 1);
+                        }
+                        setSelectedTile({ r: nextR, c: nextC });
+                      }}
+                      title="Step to next tile"
+                    >
+                      Next Tile ▶
+                    </button>
+                    <button
+                      className="terrain3d-sat-nav-btn terrain3d-sat-nav-btn--close"
+                      onClick={() => setSelectedTile(null)}
+                      title="Close"
+                    >
+                      Close
+                    </button>
+                  </div>
+                </div>
+              )}
 
               {/* Orbit HUD badge */}
               <div className="terrain3d-orbit-hud">
@@ -1563,31 +2747,7 @@ export default function Terrain3DViewer({
                 <span>Pitch: {Math.round(pitch)}&deg;</span>
               </div>
 
-              {/* Vertical height adjuster */}
-              <div
-                className="terrain3d-height-float"
-                title="Vertical height exaggeration"
-                onMouseDown={(e) => e.stopPropagation()}
-                onMouseMove={(e) => e.stopPropagation()}
-                onMouseUp={(e) => e.stopPropagation()}
-                onTouchStart={(e) => e.stopPropagation()}
-                onTouchMove={(e) => e.stopPropagation()}
-              >
-                <span>Height</span>
-                <input
-                  type="range"
-                  min="1"
-                  max="8"
-                  step="0.5"
-                  value={zExaggeration}
-                  onChange={(e) => setZExaggeration(parseFloat(e.target.value))}
-                  className="terrain3d-height-range"
-                  aria-label="Vertical height exaggeration"
-                  onMouseDown={(e) => e.stopPropagation()}
-                  onTouchStart={(e) => e.stopPropagation()}
-                />
-                <strong className="terrain3d-height-val">{zExaggeration.toFixed(1)}&times;</strong>
-              </div>
+
 
               {/* ─── Floating 3D Timeline & Real-Time Physics Controller ─── */}
               <div
@@ -1627,40 +2787,12 @@ export default function Terrain3DViewer({
                     value={animFrame}
                     onChange={(e) => handleScrub(parseFloat(e.target.value))}
                     onMouseDown={(e) => e.stopPropagation()}
-                    onMouseMove={(e) => e.stopPropagation()}
                     onTouchStart={(e) => e.stopPropagation()}
-                    onTouchMove={(e) => e.stopPropagation()}
                   />
                   <div className="terrain3d-timeline-ticks">
-                    {timestepLabels.length > 0 ? (
-                      timestepLabels.map((lbl, idx) => <span key={idx}>{lbl}</span>)
-                    ) : timeUnit === 'seconds' ? (
-                      <>
-                        <span>0s</span>
-                        <span>15s</span>
-                        <span>30s</span>
-                        <span>45s</span>
-                        <span>60s</span>
-                        <span>90s</span>
-                      </>
-                    ) : timeUnit === 'minutes' ? (
-                      <>
-                        <span>0m</span>
-                        <span>2m</span>
-                        <span>5m</span>
-                        <span>8m</span>
-                        <span>12m</span>
-                        <span>15m</span>
-                      </>
-                    ) : (
-                      <>
-                        <span>0h</span>
-                        <span>{(totalSimulationTime * 0.25).toFixed(0)}h</span>
-                        <span>{(totalSimulationTime * 0.5).toFixed(0)}h</span>
-                        <span>{(totalSimulationTime * 0.75).toFixed(0)}h</span>
-                        <span>{totalSimulationTime.toFixed(0)}h</span>
-                      </>
-                    )}
+                    {dynamicTicks.map((lbl, idx) => (
+                      <span key={idx}>{lbl}</span>
+                    ))}
                   </div>
                 </div>
 
@@ -1685,19 +2817,6 @@ export default function Terrain3DViewer({
                 >
                   {physicsLabel}: {physicsEnabled ? 'ON' : 'OFF'}
                 </button>
-
-                <button
-                  className={`terrain3d-physics-pill ${tileNumberMode !== 'off' ? 'terrain3d-physics-pill--active' : ''}`}
-                  onClick={() => {
-                    setTileNumberMode((prev) =>
-                      prev === 'id' ? 'elev' : prev === 'elev' ? 'hazard' : prev === 'hazard' ? 'off' : 'id'
-                    );
-                  }}
-                  title="Cycle 3D tile corner number: Tile # -> Elevation (m) -> Live Hazard -> Off"
-                  onMouseDown={(e) => e.stopPropagation()}
-                >
-                  🏷️ {tileNumberMode === 'id' ? 'Tile #' : tileNumberMode === 'elev' ? 'Elev' : tileNumberMode === 'hazard' ? 'Hazard' : 'Tiles: Off'}
-                </button>
               </div>
             </div>
 
@@ -1705,21 +2824,40 @@ export default function Terrain3DViewer({
             <div
               className="terrain3d-zoombar"
               onMouseDown={(e) => e.stopPropagation()}
-              onMouseMove={(e) => e.stopPropagation()}
               onTouchStart={(e) => e.stopPropagation()}
+              onWheel={(e) => {
+                e.stopPropagation();
+                const dy = e.deltaY;
+                const factor = dy < 0 ? 1.15 : 0.87;
+                setZoom((z) => Math.max(0.6, Math.min(6.5, +(z * factor).toFixed(2))));
+              }}
             >
               <span>Zoom</span>
+              <button
+                type="button"
+                className="terrain3d-zoom-btn"
+                onClick={() => setZoom((z) => Math.max(0.6, +(z - 0.25).toFixed(2)))}
+                title="Zoom Out (-)"
+              >
+                &minus;
+              </button>
               <input
                 type="range"
-                min="0.5"
-                max="4"
-                step="0.1"
+                min="0.6"
+                max="6.5"
+                step="0.05"
                 value={zoom}
                 onChange={(e) => setZoom(Number(e.target.value))}
                 aria-label="3D zoom"
-                onMouseDown={(e) => e.stopPropagation()}
-                onTouchStart={(e) => e.stopPropagation()}
               />
+              <button
+                type="button"
+                className="terrain3d-zoom-btn"
+                onClick={() => setZoom((z) => Math.min(6.5, +(z + 0.25).toFixed(2)))}
+                title="Zoom In (+)"
+              >
+                +
+              </button>
               <strong>{zoom.toFixed(1)}&times;</strong>
             </div>
           </div>

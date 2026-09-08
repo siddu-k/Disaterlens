@@ -82,6 +82,23 @@ function roadStatusThresholds(disasterType?: string): { closed: number; restrict
   }
 }
 
+function getWindCompassLabel(deg: number): string {
+  const directions = [
+    { label: 'N', min: 337.5, max: 360 },
+    { label: 'N', min: 0, max: 22.5 },
+    { label: 'NE', min: 22.5, max: 67.5 },
+    { label: 'E', min: 67.5, max: 112.5 },
+    { label: 'SE', min: 112.5, max: 157.5 },
+    { label: 'S', min: 157.5, max: 202.5 },
+    { label: 'SW', min: 202.5, max: 247.5 },
+    { label: 'W', min: 247.5, max: 292.5 },
+    { label: 'NW', min: 292.5, max: 337.5 },
+  ];
+  const d = ((deg % 360) + 360) % 360;
+  const match = directions.find((dir) => d >= dir.min && d < dir.max);
+  return match ? `${match.label} (${Math.round(d)}°)` : `${Math.round(d)}°`;
+}
+
 interface MapViewProps {
   mapMode: 'satellite' | 'map';
   setMapMode: (mode: 'satellite' | 'map') => void;
@@ -101,6 +118,14 @@ interface MapViewProps {
   setIsPlaying?: (playing: boolean) => void;
   playSpeed?: number;
   setPlaySpeed?: (speed: number) => void;
+  ignitionLat?: number | null;
+  ignitionLon?: number | null;
+  initialFireRadiusM?: number;
+  wildfireWindDir?: number;
+  wildfireWindSpeed?: number;
+  onIgnitionSelect?: (lat: number, lon: number) => void;
+  isPickingIgnition?: boolean;
+  setIsPickingIgnition?: (val: boolean) => void;
 }
 
 const TILE_URLS = {
@@ -261,25 +286,39 @@ function renderHazardCanvas(
           data[idx + 3] = 0;
         }
       } else if (disaster === 'wildfire') {
-        if (val > 0.05) {
-          const turbulence = Math.sin(px * 0.09 + py * 0.12) * 0.06;
-          let r = 239, g = 68, b = 68;
-          if (val > 0.6) {
-            const t = (val - 0.6) / 0.4;
-            r = 255;
-            g = Math.round(140 + t * 110);
-            b = Math.round(40 + t * 140);
-          } else if (val > 0.3) {
-            const t = (val - 0.3) / 0.3;
-            r = Math.round(240 + t * 15);
-            g = Math.round(70 + t * 70);
-            b = 30;
+        if (val > 0.08) {
+          const turbulence = Math.sin(px * 0.12 + py * 0.15) * 0.05;
+          let r = 239, g = 68, b = 68, a = 180;
+
+          if (val >= 0.75) {
+            // 1. Active Flaming Perimeter (meter-by-meter incandescent fire line)
+            const t = Math.min((val - 0.75) / 0.25, 1.0);
+            // Radiant flame gradient: Crimson -> Blazing Orange -> Hot Yellow core
+            r = Math.min(255, Math.round(245 + t * 10));
+            g = Math.min(255, Math.round(80 + t * 155));
+            b = Math.min(255, Math.round(15 + t * 90));
+            a = Math.min(255, Math.round((215 + t * 40) * featherFactor));
+          } else if (val >= 0.40) {
+            // 2. Smoldering Embers & Burnt Sienna Transition Zone
+            const t = (val - 0.40) / 0.35;
+            r = Math.round(185 + t * 50);
+            g = Math.round(45 + t * 45);
+            b = Math.round(12 + t * 15);
+            a = Math.round((140 + t * 60) * featherFactor);
+          } else {
+            // 3. Cold Charred Burn Scar / Ash Bed (soot charcoal allows streets/terrain to show)
+            const t = (val - 0.08) / 0.32;
+            r = Math.round(28 + t * 20);
+            g = Math.round(32 + t * 16);
+            b = Math.round(38 + t * 14);
+            a = Math.round((65 + t * 45) * featherFactor);
           }
+
           const mult = 1.0 + turbulence;
           data[idx] = Math.min(255, Math.round(r * mult));
           data[idx + 1] = Math.min(255, Math.round(g * mult));
           data[idx + 2] = Math.min(255, Math.round(b * mult));
-          data[idx + 3] = Math.min(255, Math.round(Math.min(val * 230 + 40, 235) * featherFactor));
+          data[idx + 3] = Math.min(255, a);
         } else {
           data[idx + 3] = 0;
         }
@@ -294,16 +333,70 @@ function renderHazardCanvas(
           data[idx + 3] = 0;
         }
       } else {
-        // Cyclone wind speed
-        if (val > 65) {
-          const norm = Math.min(Math.max((val - 65) / 140, 0), 1.0);
-          const r = Math.round(14 + norm * 200);
-          const g = Math.round(165 - norm * 100);
-          const b = Math.round(233 + norm * 22);
+        // Cyclone: NOAA WSR-88D Meteorological Doppler Radar & Saffir-Simpson Colormap
+        if (val >= 35) {
+          let r = 56, g = 189, b = 248, a = 125;
+          if (val >= 252) {
+            // Category 5 Super Cyclone: White-hot violet/pink core (>= 252 km/h)
+            const t = Math.min((val - 252) / 55, 1.0);
+            r = Math.round(245 + t * 10);
+            g = Math.round(210 + t * 45);
+            b = 255;
+            a = 235;
+          } else if (val >= 209) {
+            // Category 4: Deep electric magenta / purple (209 - 251 km/h)
+            const t = (val - 209) / 42;
+            r = Math.round(192 + t * 45);
+            g = Math.round(38 + t * 40);
+            b = Math.round(211 + t * 35);
+            a = 220;
+          } else if (val >= 178) {
+            // Category 3 Major Cyclone: Crimson red (178 - 208 km/h)
+            const t = (val - 178) / 31;
+            r = Math.round(239 + t * 16);
+            g = Math.round(68 - t * 40);
+            b = Math.round(68 - t * 40);
+            a = 205;
+          } else if (val >= 154) {
+            // Category 2: Fiery deep orange (154 - 177 km/h)
+            const t = (val - 154) / 24;
+            r = Math.round(249 + t * 6);
+            g = Math.round(115 - t * 35);
+            b = 22;
+            a = 190;
+          } else if (val >= 119) {
+            // Category 1: Amber yellow (119 - 153 km/h)
+            const t = (val - 119) / 35;
+            r = Math.round(234 + t * 15);
+            g = Math.round(179 - t * 50);
+            b = 8;
+            a = 170;
+          } else if (val >= 88) {
+            // Severe Tropical Storm: Chartreuse / lime green (88 - 118 km/h)
+            const t = (val - 88) / 30;
+            r = Math.round(132 + t * 90);
+            g = Math.round(204 + t * 10);
+            b = Math.round(22 - t * 15);
+            a = 150;
+          } else if (val >= 63) {
+            // Tropical Storm: Emerald green (63 - 87 km/h)
+            const t = (val - 63) / 24;
+            r = Math.round(16 + t * 95);
+            g = Math.round(185 + t * 25);
+            b = Math.round(129 - t * 85);
+            a = 135;
+          } else {
+            // Gale / Depression: Translucent cyan (35 - 62 km/h)
+            const t = (val - 35) / 28;
+            r = Math.round(34 + t * 10);
+            g = Math.round(211 - t * 15);
+            b = Math.round(238 - t * 20);
+            a = Math.round(85 + t * 40);
+          }
           data[idx] = r;
           data[idx + 1] = g;
           data[idx + 2] = b;
-          data[idx + 3] = Math.round((120 + norm * 110) * featherFactor);
+          data[idx + 3] = Math.round(a * featherFactor);
         } else {
           data[idx + 3] = 0;
         }
@@ -334,6 +427,14 @@ export default function MapView({
   setIsPlaying,
   playSpeed,
   setPlaySpeed,
+  ignitionLat,
+  ignitionLon,
+  initialFireRadiusM = 10,
+  wildfireWindDir = 135,
+  wildfireWindSpeed = 25,
+  onIgnitionSelect,
+  isPickingIgnition = false,
+  setIsPickingIgnition,
 }: MapViewProps) {
   const hz = hazardDisplay(disasterType);
   const mapContainerRef = useRef<HTMLDivElement>(null);
@@ -344,6 +445,8 @@ export default function MapView({
   const buildingsLayerRef = useRef<L.LayerGroup | null>(null);
   const facilitiesLayerRef = useRef<L.LayerGroup | null>(null);
   const routesLayerRef = useRef<L.LayerGroup | null>(null);
+  const cycloneTrackLayerRef = useRef<L.LayerGroup | null>(null);
+  const wildfireOverlayLayerRef = useRef<L.LayerGroup | null>(null);
   const bboxRectRef = useRef<L.Rectangle | null>(null);
   const lastRunUuidRef = useRef<string>('');
   const landmarksLayerRef = useRef<L.LayerGroup | null>(null);
@@ -356,9 +459,33 @@ export default function MapView({
   // hazard overlay (separate effect) carry the animation. Vectors refresh on pause.
   const vectorRenderKeyRef = useRef<string>('');
   const viewportTimerRef = useRef<number | null>(null);
+  const onIgnitionSelectRef = useRef(onIgnitionSelect);
+  const disasterTypeRef = useRef(disasterType);
+  const setIsPickingIgnitionRef = useRef(setIsPickingIgnition);
+  const isPickingIgnitionRef = useRef(isPickingIgnition);
+
+  useEffect(() => {
+    onIgnitionSelectRef.current = onIgnitionSelect;
+    disasterTypeRef.current = disasterType;
+    setIsPickingIgnitionRef.current = setIsPickingIgnition;
+    isPickingIgnitionRef.current = isPickingIgnition;
+  }, [onIgnitionSelect, disasterType, setIsPickingIgnition, isPickingIgnition]);
 
   const [isDrawing, setIsDrawing] = useState(false);
   const isDrawingRef = useRef(false);
+
+  // Sync cursor when picking ignition point
+  useEffect(() => {
+    if (!mapRef.current) return;
+    const container = mapRef.current.getContainer();
+    if (isPickingIgnition) {
+      container.classList.add('map-picking-active');
+      container.style.cursor = 'crosshair';
+    } else if (!isDrawing) {
+      container.classList.remove('map-picking-active');
+      container.style.cursor = '';
+    }
+  }, [isPickingIgnition, isDrawing]);
   const [selectedFacility, setSelectedFacility] = useState<Facility | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [selectedBuilding, setSelectedBuilding] = useState<BuildingFeature | null>(null);
@@ -435,6 +562,8 @@ export default function MapView({
     buildingsLayerRef.current = L.layerGroup().addTo(map);
     facilitiesLayerRef.current = L.layerGroup().addTo(map);
     routesLayerRef.current = L.layerGroup().addTo(map);
+    cycloneTrackLayerRef.current = L.layerGroup().addTo(map);
+    wildfireOverlayLayerRef.current = L.layerGroup().addTo(map);
     landmarksLayerRef.current = L.layerGroup().addTo(map);
 
     // Track camera (zoom + pan) so vectors render only for the visible viewport.
@@ -509,21 +638,44 @@ export default function MapView({
       }
     };
 
+    const onMapClick = (e: L.LeafletMouseEvent) => {
+      if (isDrawingRef.current) return;
+      if (disasterTypeRef.current === 'wildfire' && isPickingIgnitionRef.current && onIgnitionSelectRef.current) {
+        onIgnitionSelectRef.current(e.latlng.lat, e.latlng.lng);
+        if (setIsPickingIgnitionRef.current) {
+          setIsPickingIgnitionRef.current(false);
+        }
+      }
+    };
+
     map.on('mousedown', onMouseDown);
     map.on('mousemove', onMouseMove);
     map.on('mouseup', onMouseUp);
+    map.on('click', onMapClick);
 
     return () => {
       if (viewportTimerRef.current) window.clearTimeout(viewportTimerRef.current);
       map.off('mousedown', onMouseDown);
       map.off('mousemove', onMouseMove);
       map.off('mouseup', onMouseUp);
+      map.off('click', onMapClick);
       map.remove();
       mapRef.current = null;
     };
   }, []);
 
-  // Sync Tile Layer
+  // Auto-resize Map when layout panels are dragged / resized
+  useEffect(() => {
+    const el = mapContainerRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => {
+      if (mapRef.current) {
+        mapRef.current.invalidateSize();
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
   useEffect(() => {
     if (!tileLayerRef.current) return;
     tileLayerRef.current.setUrl(TILE_URLS[mapMode]);
@@ -654,10 +806,12 @@ export default function MapView({
 
     // Playback guard: during active timeline playback, skip heavy vector DOM rebuilds to keep FPS smooth.
     // On pause or manual slider scrubbing, vectors update to match frameIdx.
+    // NOTE: frameIdx is deliberately NOT part of renderKey — including it would
+    // change the key every tick and disable the guard (tab freeze during play).
     const vpKey = mapViewport
       ? `${mapViewport.south.toFixed(4)},${mapViewport.west.toFixed(4)},${mapViewport.north.toFixed(4)},${mapViewport.east.toFixed(4)}`
       : 'novp';
-    const renderKey = `${result.run_uuid || 'noid'}-${mapZoom}-${buildingDensity || 'medium'}-${vpKey}-${frameIdx}`;
+    const renderKey = `${result.run_uuid || 'noid'}-${mapZoom}-${buildingDensity || 'medium'}-${vpKey}`;
     if (isPlaying && vectorRenderKeyRef.current === renderKey) return;
     vectorRenderKeyRef.current = renderKey;
 
@@ -869,16 +1023,6 @@ export default function MapView({
         : '';
 
       if (isClosed) {
-        // Dual-stroke illuminated neon red glow (skipped when zoomed out: halves objects)
-        if (mapZoom >= ROAD_GLOW_MIN_ZOOM) {
-          L.polyline(pts, {
-            color: '#ef4444',
-            weight: baseWeight * 2.2,
-            opacity: 0.40,
-            interactive: false,
-          }).addTo(roadsLayerRef.current!);
-        }
-
         const poly = L.polyline(pts, {
           color: '#f87171',
           weight: baseWeight,
@@ -899,16 +1043,6 @@ export default function MapView({
           closedRoadsForBadging.push({ ...road, status });
         }
       } else if (isRestricted) {
-        // Dual-stroke warning amber glow (skipped when zoomed out: halves objects)
-        if (mapZoom >= ROAD_GLOW_MIN_ZOOM) {
-          L.polyline(pts, {
-            color: '#f59e0b',
-            weight: baseWeight * 1.8,
-            opacity: 0.35,
-            interactive: false,
-          }).addTo(roadsLayerRef.current!);
-        }
-
         const poly = L.polyline(pts, {
           color: '#fbbf24',
           weight: baseWeight * 0.9,
@@ -925,16 +1059,6 @@ export default function MapView({
           setSelectedBuilding(null);
         });
       } else {
-        // Crisp open green corridor with clear hierarchy
-        if (isMajor && mapZoom >= ROAD_GLOW_MIN_ZOOM) {
-          L.polyline(pts, {
-            color: '#059669',
-            weight: baseWeight * 1.6,
-            opacity: 0.28,
-            interactive: false,
-          }).addTo(roadsLayerRef.current!);
-        }
-
         const poly = L.polyline(pts, {
           color: '#10b981',
           weight: baseWeight * 0.85,
@@ -1124,14 +1248,6 @@ export default function MapView({
       const latlngs: [number, number][] = route.path_coordinates ? route.path_coordinates.map((c) => [c[1], c[0]]) : [];
       if (latlngs.length < 2) return;
 
-      // Route glow effect (decorative underlay — non-interactive so clicks reach the route line)
-      L.polyline(latlngs, {
-        color: '#10b981',
-        weight: 8,
-        opacity: 0.35,
-        interactive: false,
-      }).addTo(routesLayerRef.current!);
-
       // Primary safe path with flowing animation
       L.polyline(latlngs, {
         color: '#34d399',
@@ -1144,6 +1260,256 @@ export default function MapView({
       );
     });
   }, [showEvacuationRoutes, result]);
+
+  // Render Cyclone Track Trajectory, Calm Eye Well, Spiral Rainband Inflow & Tactical Eye Marker on 2D Leaflet Map
+  useEffect(() => {
+    if (!mapRef.current || !cycloneTrackLayerRef.current) return;
+    cycloneTrackLayerRef.current.clearLayers();
+
+    if (!result || result.simulation?.disaster_type !== 'cyclone') return;
+    const meta = (result.simulation as any)?.metadata;
+    const tracks: Array<{ lat: number; lon: number; wind_kmh: number; time_h: number; pressure_hpa?: number; category?: string }> =
+      meta?.track_points || [];
+    if (tracks.length < 2) return;
+
+    const latlngs: [number, number][] = tracks.map((t) => [t.lat, t.lon]);
+    const dirDeg = meta?.cyclone_direction_deg ?? 315;
+    const forwardSpeed = meta?.forward_speed_kmh ?? 22;
+    const rMaxKm = meta?.cyclone_radius_km ?? 35;
+    const stormRadiusKm = meta?.storm_radius_km ?? 180;
+
+    // Outer glow for track line
+    L.polyline(latlngs, {
+      color: '#facc15',
+      weight: 6,
+      opacity: 0.35,
+      interactive: false,
+    }).addTo(cycloneTrackLayerRef.current);
+
+    // Dotted track path line
+    L.polyline(latlngs, {
+      color: '#f59e0b',
+      weight: 3,
+      opacity: 0.95,
+      dashArray: '8, 6',
+    }).addTo(cycloneTrackLayerRef.current).bindTooltip(
+      `<strong>🌀 Cyclone Movement Track</strong><br/>Heading: ${dirDeg}° &bull; Speed: ${forwardSpeed} km/h<br/>Total Track: ${tracks.length} Forecast Intervals`,
+      { sticky: true, className: 'custom-map-tooltip' }
+    );
+
+    // Waypoint markers along track showing storm intensity progression
+    tracks.forEach((wpt, i) => {
+      const isStart = i === 0;
+      const isEnd = i === tracks.length - 1;
+      const wpColor = wpt.wind_kmh >= 209 ? '#f43f5e' : wpt.wind_kmh >= 154 ? '#fb923c' : wpt.wind_kmh >= 119 ? '#facc15' : '#38bdf8';
+      L.circleMarker([wpt.lat, wpt.lon], {
+        radius: isStart || isEnd ? 5.5 : 3.5,
+        color: '#ffffff',
+        weight: 1.5,
+        fillColor: wpColor,
+        fillOpacity: 0.95,
+      }).addTo(cycloneTrackLayerRef.current!).bindTooltip(
+        `<strong>Waypoint ${wpt.time_h}h</strong><br/>Category: ${wpt.category || 'Storm'}<br/>Peak Wind: ${Math.round(wpt.wind_kmh)} km/h<br/>Pressure: ${wpt.pressure_hpa ? Math.round(wpt.pressure_hpa) + ' hPa' : 'N/A'}`,
+        { sticky: true, className: 'custom-map-tooltip' }
+      );
+    });
+
+    // Pick the track point for the current simulation frame
+    const frameIndex = Math.min(tracks.length - 1, Math.max(0, currentFrame));
+    const activePt = tracks[frameIndex] || tracks[0];
+    const rMaxMeters = rMaxKm * 1000;
+    const eyeCalmMeters = rMaxMeters * 0.45;
+    const outerGaleMeters = stormRadiusKm * 1000;
+
+    // 1. Outer Storm Gale Radius Ring
+    L.circle([activePt.lat, activePt.lon], {
+      radius: outerGaleMeters,
+      color: '#38bdf8',
+      weight: 1.2,
+      opacity: 0.5,
+      fillColor: '#38bdf8',
+      fillOpacity: 0.03,
+      dashArray: '6, 8',
+    }).addTo(cycloneTrackLayerRef.current).bindTooltip(
+      `<strong>Outer Circulation Boundary</strong><br/>Radius: ${stormRadiusKm} km &bull; Outer Squalls (~35–50 km/h)<br/><span style="font-size:10.5px;color:#94a3b8;">Destructive hurricane damage is concentrated within Eyewall (${rMaxKm} km)</span>`,
+      { sticky: true, className: 'custom-map-tooltip' }
+    );
+
+    // 2. Outer Eyewall Radius Circle (Peak Wind Zone)
+    L.circle([activePt.lat, activePt.lon], {
+      radius: rMaxMeters,
+      color: '#ef4444',
+      weight: 2.2,
+      opacity: 0.9,
+      fillColor: '#ef4444',
+      fillOpacity: 0.12,
+      dashArray: '5, 4',
+    }).addTo(cycloneTrackLayerRef.current).bindTooltip(
+      `<strong>Cyclone Eyewall (Rmax)</strong><br/>Radius: ${rMaxKm} km<br/>Peak Eyewall Wind: ${Math.round(activePt.wind_kmh || meta?.peak_wind_kmh)} km/h`,
+      { sticky: true, className: 'custom-map-tooltip' }
+    );
+
+    // 3. Inner Calm Eye Well (Clear Sky cavity with low winds)
+    L.circle([activePt.lat, activePt.lon], {
+      radius: eyeCalmMeters,
+      color: '#ffffff',
+      weight: 1.5,
+      opacity: 0.95,
+      fillColor: '#0f172a',
+      fillOpacity: 0.55,
+      dashArray: '3, 3',
+    }).addTo(cycloneTrackLayerRef.current).bindTooltip(
+      `<strong>🌀 Calm Eye Core</strong><br/>Radius: ${Math.round(rMaxKm * 0.45)} km<br/>Pressure: ${activePt.pressure_hpa ? Math.round(activePt.pressure_hpa) + ' hPa' : meta?.central_pressure_hpa + ' hPa'}<br/>Condition: Calm Winds (< 30 km/h)`,
+      { sticky: true, className: 'custom-map-tooltip' }
+    );
+
+    // 4. Inflow Logarithmic Spiral Rainband Streamlines
+    const numSpiralArms = 3;
+    const spiralPointsPerArm = 24;
+    const cosLat = Math.cos((activePt.lat * Math.PI) / 180);
+    const bParam = 0.22;
+
+    for (let arm = 0; arm < numSpiralArms; arm++) {
+      const armOffset = (arm * 2 * Math.PI) / numSpiralArms;
+      const armCoords: [number, number][] = [];
+      for (let s = 0; s < spiralPointsPerArm; s++) {
+        const theta = (s / spiralPointsPerArm) * Math.PI * 2.2;
+        const radKm = rMaxKm * 0.7 * Math.exp(bParam * theta);
+        if (radKm > stormRadiusKm * 1.05) break;
+        const totalAngle = theta + armOffset;
+        const dLat = (radKm / 111.32) * Math.cos(totalAngle);
+        const dLon = (radKm / (111.32 * Math.max(0.1, cosLat))) * Math.sin(totalAngle);
+        armCoords.push([activePt.lat + dLat, activePt.lon + dLon]);
+      }
+      if (armCoords.length > 3) {
+        L.polyline(armCoords, {
+          color: arm === 0 ? '#38bdf8' : '#c084fc',
+          weight: 1.8,
+          opacity: 0.65,
+          dashArray: '6, 5',
+          interactive: false,
+        }).addTo(cycloneTrackLayerRef.current);
+      }
+    }
+
+    // 5. Forward Translation Vector Arrow (Heading Indicator)
+    const arrowDistKm = Math.max(18, rMaxKm * 0.75);
+    const headingRad = (dirDeg * Math.PI) / 180;
+    const arrowLat = activePt.lat + (arrowDistKm / 111.32) * Math.cos(headingRad);
+    const arrowLon = activePt.lon + (arrowDistKm / (111.32 * Math.max(0.1, cosLat))) * Math.sin(headingRad);
+    L.polyline([[activePt.lat, activePt.lon], [arrowLat, arrowLon]], {
+      color: '#38bdf8',
+      weight: 2.8,
+      opacity: 0.95,
+      dashArray: undefined,
+    }).addTo(cycloneTrackLayerRef.current);
+
+    // 6. Tactical Eye Center Icon Marker with Category Badge
+    const catShort = (activePt.category || meta?.saffir_simpson_category || 'Cyclone').split(' ')[0];
+    const eyeIcon = L.divIcon({
+      className: 'cyclone-eye-map-marker',
+      html: `
+        <div style="position:relative;display:flex;align-items:center;justify-content:center;">
+          <div style="width:30px;height:30px;border-radius:50%;background:radial-gradient(circle, #ef4444 0%, #991b1b 100%);border:2px solid #ffffff;display:flex;align-items:center;justify-content:center;font-size:15px;box-shadow:0 2px 8px rgba(0,0,0,0.6);">
+            🌀
+          </div>
+          <div style="position:absolute;top:-18px;left:50%;transform:translateX(-50%);white-space:nowrap;background:rgba(15,23,42,0.92);border:1px solid #38bdf8;padding:1px 6px;border-radius:4px;font-size:9.5px;font-weight:700;color:#38bdf8;box-shadow:0 2px 6px rgba(0,0,0,0.5);">
+            ${catShort} • ${Math.round(activePt.wind_kmh || meta?.peak_wind_kmh)} km/h
+          </div>
+        </div>
+      `,
+      iconSize: [30, 30],
+      iconAnchor: [15, 15],
+    });
+
+    L.marker([activePt.lat, activePt.lon], { icon: eyeIcon })
+      .addTo(cycloneTrackLayerRef.current)
+      .bindTooltip(
+        `<strong>🌀 Cyclone Center (${activePt.time_h}h)</strong><br/>Category: ${activePt.category || meta?.saffir_simpson_category}<br/>Coords: ${activePt.lat.toFixed(3)}°N, ${activePt.lon.toFixed(3)}°E<br/>Central Pressure: ${activePt.pressure_hpa ? Math.round(activePt.pressure_hpa) + ' hPa' : meta?.central_pressure_hpa + ' hPa'}<br/>Peak Wind: ${Math.round(activePt.wind_kmh)} km/h<br/>Heading: ${dirDeg}° @ ${forwardSpeed} km/h`,
+        { sticky: true, className: 'custom-map-tooltip' }
+      );
+  }, [result, currentFrame]);
+
+  // Render Wildfire Ignition Point, Initial Extent & Wind Vector Overlay on 2D Leaflet Map
+  useEffect(() => {
+    if (!mapRef.current || !wildfireOverlayLayerRef.current) return;
+    wildfireOverlayLayerRef.current.clearLayers();
+
+    if (disasterType !== 'wildfire') return;
+
+    const meta = (result?.simulation as any)?.metadata;
+    const ignLat = meta?.ignition_lat ?? ignitionLat ?? (bbox ? (bbox.north + bbox.south) / 2 : 17.385);
+    const ignLon = meta?.ignition_lon ?? ignitionLon ?? (bbox ? (bbox.east + bbox.west) / 2 : 78.486);
+    const initRad = Number(meta?.initial_fire_radius_m ?? initialFireRadiusM ?? 10);
+    const wSpeed = meta?.wind_speed_kmh ?? wildfireWindSpeed ?? 25;
+    const wDir = meta?.wind_direction_deg ?? wildfireWindDir ?? 135;
+
+    if (ignLat === null || ignLon === null || isNaN(ignLat) || isNaN(ignLon)) return;
+
+    // 1. Initial Fire Extent Circle (m)
+    L.circle([ignLat, ignLon], {
+      radius: Math.max(initRad, 10),
+      color: '#ea580c',
+      weight: 2,
+      fillColor: '#f97316',
+      fillOpacity: 0.25,
+      dashArray: '4, 4',
+    }).addTo(wildfireOverlayLayerRef.current).bindTooltip(
+      `<strong>Initial Fire Footprint</strong><br/>Radius: ${initRad} m<br/>Origin: ${ignLat.toFixed(4)}°N, ${ignLon.toFixed(4)}°E`,
+      { sticky: true, className: 'custom-map-tooltip' }
+    );
+
+    // 2. Flame Beacon Marker
+    const flameIcon = L.divIcon({
+      className: 'wildfire-ignition-map-marker',
+      html: `<div style="width:28px;height:28px;border-radius:50%;background:radial-gradient(circle, #fef08a 0%, #f97316 65%, #dc2626 100%);border:2px solid #ffffff;box-shadow:0 2px 8px rgba(0,0,0,0.5);"></div>`,
+      iconSize: [28, 28],
+      iconAnchor: [14, 14],
+    });
+
+    L.marker([ignLat, ignLon], { icon: flameIcon })
+      .addTo(wildfireOverlayLayerRef.current)
+      .bindTooltip(
+        `<strong>Wildfire Ignition Point</strong><br/>Coords: ${ignLat.toFixed(4)}°N, ${ignLon.toFixed(4)}°E<br/>Initial Radius: ${initRad}m<br/><span style="color:#fb923c;font-size:10px;">Click anywhere on map to relocate ignition</span>`,
+        { sticky: true, className: 'custom-map-tooltip' }
+      );
+
+    // 3. Wind Spread Vector Arrow pointing downwind from ignition
+    const dirRad = ((wDir - 90) * Math.PI) / 180;
+    const bSpanLat = bbox ? Math.abs(bbox.north - bbox.south) : 0.02;
+    const bSpanLon = bbox ? Math.abs(bbox.east - bbox.west) : 0.02;
+    const bSpan = Math.max(0.004, Math.min(bSpanLat, bSpanLon));
+    const arrowLen = Math.min(bSpan * 0.35, Math.max(bSpan * 0.1, (wSpeed / 100) * bSpan * 0.3));
+    const cosLat = Math.max(0.2, Math.cos((ignLat * Math.PI) / 180));
+    const tipLat = ignLat - Math.sin(dirRad) * arrowLen;
+    const tipLon = ignLon + (Math.cos(dirRad) * arrowLen) / cosLat;
+
+    // Wind vector arrow shaft
+    L.polyline([[ignLat, ignLon], [tipLat, tipLon]], {
+      color: '#38bdf8',
+      weight: 3,
+      opacity: 0.95,
+    }).addTo(wildfireOverlayLayerRef.current).bindTooltip(
+      `<strong>Wind Spread Vector</strong><br/>Direction: ${getWindCompassLabel(wDir)} (${wDir}°)<br/>Speed: ${wSpeed} km/h (Downwind wavefront propagation)${(meta as any)?.dominant_spread_driver ? `<br/>Dominant spread driver: ${(meta as any).dominant_spread_driver}${(meta as any).dominant_spread_driver === 'slope' ? ' (terrain overpowers wind)' : ''}` : ''}`,
+      { sticky: true, className: 'custom-map-tooltip' }
+    );
+
+    // Arrowhead polygon with aspect-ratio correction
+    const headAngle1 = dirRad + Math.PI * 0.85;
+    const headAngle2 = dirRad - Math.PI * 0.85;
+    const headLen = arrowLen * 0.2;
+    const h1Lat = tipLat - Math.sin(headAngle1) * headLen;
+    const h1Lon = tipLon + (Math.cos(headAngle1) * headLen) / cosLat;
+    const h2Lat = tipLat - Math.sin(headAngle2) * headLen;
+    const h2Lon = tipLon + (Math.cos(headAngle2) * headLen) / cosLat;
+
+    L.polygon([[tipLat, tipLon], [h1Lat, h1Lon], [h2Lat, h2Lon]], {
+      color: '#38bdf8',
+      fillColor: '#38bdf8',
+      fillOpacity: 0.95,
+      weight: 1.5,
+    }).addTo(wildfireOverlayLayerRef.current);
+  }, [result, disasterType, ignitionLat, ignitionLon, initialFireRadiusM, wildfireWindSpeed, wildfireWindDir, bbox]);
 
   const toggleDrawMode = () => {
     const next = !isDrawing;
@@ -1187,6 +1553,15 @@ export default function MapView({
         </div>
       )}
 
+      {/* Floating Instructions Banner while picking ignition point on map */}
+      {isPickingIgnition && (
+        <div className="drawing-guide-banner" style={{ borderColor: 'rgba(249, 115, 22, 0.6)', background: 'rgba(15, 23, 42, 0.94)' }}>
+          <span className="drawing-guide-pulse" style={{ color: '#f97316' }}>🎯</span>
+          <span>Click anywhere on the map to set the <strong>Wildfire Ignition Point</strong></span>
+          <button className="drawing-guide-cancel" onClick={() => setIsPickingIgnition?.(false)}>Cancel</button>
+        </div>
+      )}
+
       {/* Local non-blocking notice (replaces blocking alert) */}
       {notice && (
         <div className="map-notice-banner" role="alert">
@@ -1210,7 +1585,6 @@ export default function MapView({
         <div className="map-hazard-pills-row">
           {[
             { type: 'flood', icon: <IconFlood size={14} />, label: 'Flood' },
-            { type: 'cyclone', icon: <IconCyclone size={14} />, label: 'Cyclone' },
             { type: 'wildfire', icon: <IconHeatwave size={14} />, label: 'Wildfire' },
             { type: 'earthquake', icon: <IconEarthquake size={14} />, label: 'Earthquake' },
             { type: 'landslide', icon: <IconLandslide size={14} />, label: 'Landslide' },

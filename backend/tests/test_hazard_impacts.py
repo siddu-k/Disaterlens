@@ -233,3 +233,71 @@ def test_existing_keys_preserved_and_facilities():
     )
     assert wimpact["facilities"][0]["smoke_risk"] is True
     assert wimpact["population_smoke_exposed"] > 0
+
+
+# --- Wildfire spread-direction regression tests (hermetic) ---
+# Guards the compass-towards convention: fire must advance TOWARDS the
+# configured wind heading (0=N, 90=E, 180=S, 270=W), never opposite.
+
+WF_BBOX = {"south": 18.98, "west": 72.81, "north": 19.03, "east": 72.86}
+WF_ROWS, WF_COLS = 20, 20
+
+
+def _wildfire_run(wind_dir_deg, wind_speed_kmh=60.0, elevation=None):
+    from simulation.wildfire import WildfireHazardModule
+    mod = WildfireHazardModule()
+    elev = elevation if elevation is not None else np.full((WF_ROWS, WF_COLS), 10.0)
+    scenario = {
+        "wind_speed_kmh": wind_speed_kmh,
+        "wind_direction_deg": wind_dir_deg,
+        "temperature_c": 40.0,
+        "relative_humidity_pct": 15.0,
+        "duration_hours": 12.0,
+        "ignition_lat": 19.005,
+        "ignition_lon": 72.835,
+        "fuel_type": "grass",
+        "fuel_moisture_pct": 5.0,
+    }
+    return mod.run_simulation(elev, {}, scenario, resolution_m=90.0, bbox=WF_BBOX)
+
+
+def _half_sums(frame):
+    g = np.array(frame)
+    return {
+        "east": float(g[:, 11:].sum()),
+        "west": float(g[:, :9].sum()),
+        "north": float(g[:9, :].sum()),
+        "south": float(g[11:, :].sum()),
+    }
+
+
+def test_wildfire_spread_follows_wind_east_west():
+    target_frame = 4
+    east_run = _wildfire_run(90)
+    halves = _half_sums(east_run.frames[target_frame])
+    assert halves["east"] > 2.0 * halves["west"], halves
+    assert east_run.metadata["wind_direction_deg"] == 90.0
+
+    west_run = _wildfire_run(270)
+    halves = _half_sums(west_run.frames[target_frame])
+    assert halves["west"] > 2.0 * halves["east"], halves
+
+
+def test_wildfire_spread_follows_wind_north_south():
+    target_frame = 4
+    south_run = _wildfire_run(180)
+    halves = _half_sums(south_run.frames[target_frame])
+    assert halves["south"] > 2.0 * halves["north"], halves
+
+    north_run = _wildfire_run(0)
+    halves = _half_sums(north_run.frames[target_frame])
+    assert halves["north"] > 2.0 * halves["south"], halves
+
+
+def test_wildfire_spread_driver_flag():
+    windy = _wildfire_run(135, wind_speed_kmh=60.0)
+    assert windy.metadata["dominant_spread_driver"] == "wind"
+
+    tilt = np.tile((np.arange(WF_ROWS) * 8.0).reshape(-1, 1), (1, WF_COLS))
+    calm = _wildfire_run(135, wind_speed_kmh=0.5, elevation=tilt)
+    assert calm.metadata["dominant_spread_driver"] == "slope"

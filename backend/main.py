@@ -12,7 +12,7 @@ import time
 import hashlib
 import threading
 import logging
-from typing import Optional, List, Dict, Any, Literal
+from typing import Optional, List, Dict, Any, Literal, Union
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, model_validator, field_validator
 
 import config
 from geodata.elevation import fetch_elevation_grid
@@ -155,15 +155,64 @@ class SimulationRequest(BaseModel):
     magnitude: Optional[float] = Field(default=6.8, ge=4.0, le=9.5)
     depth_km: Optional[float] = Field(default=10.0, ge=1.0, le=700.0)
     # Wildfire parameters
-    wind_speed_kmh: Optional[float] = Field(default=28.0, ge=0, le=250)
-    wind_direction_deg: Optional[float] = Field(default=45.0, ge=0, le=360)
-    temperature_c: Optional[float] = Field(default=34.0, ge=0, le=60)
-    relative_humidity_pct: Optional[float] = Field(default=22.0, ge=1, le=100)
+    wind_speed_kmh: Optional[float] = Field(default=25.0, ge=0, le=250)
+    wind_direction_deg: Optional[float] = Field(default=135.0, ge=0, le=360, description="Wind heading in degrees (e.g. 135 = NW to SE)")
+    temperature_c: Optional[float] = Field(default=38.0, ge=0, le=65)
+    relative_humidity_pct: Optional[float] = Field(default=25.0, ge=1, le=100)
+    ignition_lat: Optional[float] = Field(default=None, description="Latitude of ignition source point")
+    ignition_lon: Optional[float] = Field(default=None, description="Longitude of ignition source point")
+    initial_fire_radius_m: Optional[float] = Field(default=10.0, ge=2.0, le=500.0, description="Initial fire perimeter radius in meters")
+    fuel_type: Optional[str] = Field(default="grass", description="grass, shrub, forest, agriculture")
+    fuel_moisture_pct: Optional[Union[float, str]] = Field(default=None, description="Dead fuel moisture percentage or 'auto'")
+    slope_deg: Optional[Union[float, str]] = Field(default=None, description="Terrain slope angle for upslope fire acceleration or 'auto'")
+    aspect_direction: Optional[str] = Field(default="south", description="south, north, east, west")
+    recent_rainfall_mm: Optional[float] = Field(default=2.0, ge=0.0, le=150.0, description="Rainfall in preceding 48 hours in mm")
     # Landslide parameters
     cumulative_rainfall_mm: Optional[float] = Field(default=200.0, ge=0, le=2000)
     # Cyclone parameters
     central_pressure_hpa: Optional[float] = Field(default=950.0, ge=870, le=1010)
     max_wind_kmh: Optional[float] = Field(default=165.0, ge=50, le=320)
+    cyclone_direction_deg: Optional[float] = Field(default=315.0, ge=0, le=360, description="Direction cyclone moves towards in degrees (0=N, 45=NE, 90=E, 180=S, 270=W, 315=NW)")
+    cyclone_radius_km: Optional[float] = Field(default=35.0, ge=10.0, le=120.0, description="Radius of maximum winds (Rmax) in km")
+    storm_radius_km: Optional[float] = Field(default=180.0, ge=40.0, le=500.0, description="Outer storm gale/damage radius in km")
+    forward_speed_kmh: Optional[float] = Field(default=22.0, ge=5.0, le=80.0, description="Forward translation speed of the cyclone in km/h")
+
+    @field_validator("fuel_moisture_pct", mode="before")
+    @classmethod
+    def _validate_fuel_moisture(cls, v):
+        if v is None or v == "" or (isinstance(v, str) and v.strip().lower() in ("auto", "none")):
+            return None
+        try:
+            val = float(v)
+            if not (1.0 <= val <= 45.0):
+                raise ValueError("fuel_moisture_pct must be between 1.0 and 45.0")
+            return val
+        except (TypeError, ValueError) as e:
+            if isinstance(e, ValueError) and "between 1.0 and 45.0" in str(e):
+                raise
+            raise ValueError(f"Invalid fuel_moisture_pct: {v}") from e
+
+    @field_validator("slope_deg", mode="before")
+    @classmethod
+    def _validate_slope_deg(cls, v):
+        if v is None or v == "" or (isinstance(v, str) and v.strip().lower() in ("auto", "none")):
+            return None
+        try:
+            val = float(v)
+            if not (0.0 <= val <= 60.0):
+                raise ValueError("slope_deg must be between 0.0 and 60.0")
+            return val
+        except (TypeError, ValueError) as e:
+            if isinstance(e, ValueError) and "between 0.0 and 60.0" in str(e):
+                raise
+            raise ValueError(f"Invalid slope_deg: {v}") from e
+
+    @field_validator("aspect_direction", mode="before")
+    @classmethod
+    def _validate_aspect_direction(cls, v):
+        if v is None or (isinstance(v, str) and v.strip().lower() in ("auto", "none", "")):
+            return "south"
+        return str(v).strip().lower()
 
 
 class GeodataRequest(BaseModel):
@@ -173,6 +222,7 @@ class GeodataRequest(BaseModel):
 class NaturalLanguageScenarioRequest(BaseModel):
     prompt: str
     current_disaster: str = "flood"
+    model: Optional[str] = "gemini-3.5-flash-lite"
 
 
 class AIInsightRequest(BaseModel):
@@ -193,6 +243,10 @@ class CompareRequest(BaseModel):
     scenario_b: Optional[Dict[str, Any]] = None
 
 
+class SetAiKeyRequest(BaseModel):
+    api_key: str = Field(default="", description="Google Gemini API key")
+
+
 # ─── API Endpoints ────────────────────────────────────────────────
 
 @app.get("/api/health")
@@ -203,6 +257,90 @@ async def health_check():
         "version": "2.0.0",
         "gemini_configured": bool(config.GEMINI_API_KEY),
         "supported_disasters": [d["type"] for d in get_available_disasters()],
+    }
+
+
+@app.get("/api/settings/ai-key")
+async def get_ai_key_status():
+    """Check if Gemini AI key is configured and return masked prefix/suffix."""
+    key = config.GEMINI_API_KEY
+    masked = None
+    if key:
+        clean = key.strip()
+        if len(clean) >= 10:
+            masked = f"{clean[:6]}...{clean[-4:]}"
+        else:
+            masked = "***"
+    return {
+        "configured": bool(key),
+        "masked_key": masked,
+        "model": "gemini-3.5-flash-lite",
+    }
+
+
+@app.post("/api/settings/ai-key")
+async def set_ai_key(request: SetAiKeyRequest):
+    """Set, validate, and persist the Google Gemini API key to .env and runtime config."""
+    new_key = request.api_key.strip()
+    if not new_key:
+        config.GEMINI_API_KEY = ""
+        os.environ["GEMINI_API_KEY"] = ""
+        try:
+            import ai.gemini as gemini_mod
+            gemini_mod._client = None
+        except Exception:
+            pass
+        try:
+            env_path = os.path.join(os.path.dirname(__file__), ".env")
+            if os.path.exists(env_path):
+                with open(env_path, "w", encoding="utf-8") as f:
+                    f.write('GEMINI_API_KEY=""\n')
+        except Exception:
+            pass
+        return {
+            "status": "cleared",
+            "configured": False,
+            "masked_key": None,
+            "message": "Gemini API key cleared.",
+        }
+
+    # 1. Update runtime configuration and OS environment
+    config.GEMINI_API_KEY = new_key
+    os.environ["GEMINI_API_KEY"] = new_key
+
+    # 2. Reset singleton client in ai.gemini module so new key is picked up immediately
+    try:
+        import ai.gemini as gemini_mod
+        gemini_mod._client = None
+    except Exception as e:
+        logger.warning(f"Could not reset Gemini client: {e}")
+
+    # 3. Persist to backend/.env
+    try:
+        env_path = os.path.join(os.path.dirname(__file__), ".env")
+        lines = []
+        key_found = False
+        if os.path.exists(env_path):
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip().startswith("GEMINI_API_KEY="):
+                        lines.append(f'GEMINI_API_KEY="{new_key}"\n')
+                        key_found = True
+                    else:
+                        lines.append(line)
+        if not key_found:
+            lines.append(f'GEMINI_API_KEY="{new_key}"\n')
+        with open(env_path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+    except Exception as e:
+        logger.warning(f"Could not persist GEMINI_API_KEY to .env: {e}")
+
+    masked = f"{new_key[:6]}...{new_key[-4:]}" if len(new_key) >= 10 else "***"
+    return {
+        "status": "success",
+        "configured": True,
+        "masked_key": masked,
+        "message": "Gemini API key updated and persisted successfully.",
     }
 
 
@@ -285,7 +423,7 @@ async def get_preset_scenarios():
 def parse_scenario(request: NaturalLanguageScenarioRequest):
     """Convert natural language query into strict validated simulation parameters."""
     try:
-        result = parse_natural_language_scenario(request.prompt, request.current_disaster)
+        result = parse_natural_language_scenario(request.prompt, request.current_disaster, request.model)
         return result
     except Exception as e:
         logger.exception("Scenario parse failed")
@@ -524,6 +662,7 @@ def run_simulation_endpoint(request: SimulationRequest):
         }
         try:
             _meta = hazard_output.metadata or {}
+            simulation_payload["metadata"] = _meta
             if _meta.get("surge_grid") is not None:
                 simulation_payload["surge_grid"] = _meta.get("surge_grid")
             if _meta.get("max_surge_m") is not None:
@@ -535,6 +674,7 @@ def run_simulation_endpoint(request: SimulationRequest):
             "is_synthetic": top_is_synthetic,
             "data_quality": data_quality,
             "warnings": warnings,
+            "metadata": _meta,
             "simulation": simulation_payload,
             "impact": impact,
             "geodata": {
@@ -724,5 +864,5 @@ def compare_simulations_endpoint(request: CompareRequest):
 if __name__ == "__main__":
     import uvicorn
     logger.info("\n[*] DisasterLens API Server Starting...")
-    logger.info("    Gemini API: %s", '[OK] Configured' if config.GEMINI_API_KEY else '[!] Offline mode (deterministic rule-based insights)')
+    # DisasterLens Fast-Marching Wavefront Wildfire Engine Active
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

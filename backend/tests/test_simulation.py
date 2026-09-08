@@ -118,6 +118,116 @@ def test_cyclone_radial_wind_and_category():
     wind = np.array(out.max_hazard)
     assert np.max(wind) > 130.0
     assert "Category" in out.metadata["saffir_simpson_category"]
+    assert "imd_category" in out.metadata
+    assert "surge_grid" in out.metadata
+    assert "track_points" in out.metadata
+    assert len(out.metadata["track_points"]) == 12
+    assert "surge_time_factors" in out.metadata
+    assert out.metadata["surge_time_factors"][0] == 0.0
+    # Peak surge occurs at or near closest approach
+    assert max(out.metadata["surge_time_factors"]) >= 0.85
+
+
+def test_cyclone_temporal_onset_and_decay():
+    """Verify that the AOI is calm at Frame 0 and does not experience premature cyclone effects."""
+    mod = CycloneHazardModule()
+    elev = np.ones((15, 15), dtype=np.float64) * 5.0
+    bbox = {"south": 18.9, "west": 72.8, "north": 19.1, "east": 73.0}
+
+    out = mod.run_simulation(
+        elevation=elev,
+        geodata={},
+        scenario={"central_pressure_hpa": 935.0, "max_wind_kmh": 185.0, "duration_hours": 12.0},
+        bbox=bbox,
+    )
+
+    # Frame 0 must be ambient pre-storm breeze (15 km/h), completely safe
+    f0 = np.array(out.frames[0])
+    assert np.all(f0 <= 20.0)
+
+    # Frame 1 (early approach) must be well below hurricane thresholds (< 45 km/h)
+    f1 = np.array(out.frames[1])
+    assert np.max(f1) < 45.0
+
+    # Eyewall arrival at middle frames must reach severe hurricane force
+    mid_frames_max = max(np.max(np.array(out.frames[i])) for i in range(3, 8))
+    assert mid_frames_max >= 130.0
+
+    # Final frame (after cyclone exits) must decay significantly
+    f_last = np.array(out.frames[-1])
+    assert np.mean(f_last) < 40.0
+
+
+def test_cyclone_custom_direction_and_radius():
+    mod = CycloneHazardModule()
+    elev = np.ones((15, 15), dtype=np.float64) * 10.0
+    bbox = {"south": 18.9, "west": 72.8, "north": 19.1, "east": 73.0}
+
+    out = mod.run_simulation(
+        elevation=elev,
+        geodata={},
+        scenario={
+            "central_pressure_hpa": 940.0,
+            "max_wind_kmh": 175.0,
+            "duration_hours": 18.0,
+            "cyclone_direction_deg": 270.0,  # Moving Westbound
+            "cyclone_radius_km": 45.0,
+            "storm_radius_km": 200.0,
+            "forward_speed_kmh": 25.0,
+        },
+        bbox=bbox,
+    )
+
+    meta = out.metadata
+    assert meta["cyclone_direction_deg"] == 270.0
+    assert meta["cyclone_radius_km"] == 45.0
+    assert meta["forward_speed_kmh"] == 25.0
+    tracks = meta["track_points"]
+    assert len(tracks) == 12
+    # Moving westbound (270 deg): longitude must decrease over time
+    first_lon = tracks[0]["lon"]
+    last_lon = tracks[-1]["lon"]
+    assert last_lon < first_lon
+
+
+def test_wildfire_rothermel_comprehensive_parameters():
+    mod = WildfireHazardModule()
+    elev = np.ones((20, 20), dtype=np.float64) * 15.0
+    bbox = {"south": 17.3, "west": 78.4, "north": 17.5, "east": 78.6}
+
+    out = mod.run_simulation(
+        elevation=elev,
+        geodata={},
+        scenario={
+            "wind_speed_kmh": 25.0,
+            "wind_direction_deg": 135.0,  # NW to SE
+            "temperature_c": 38.0,
+            "relative_humidity_pct": 25.0,
+            "fuel_type": "grass",
+            "fuel_moisture_pct": 8.0,
+            "recent_rainfall_mm": 2.0,
+            "slope_deg": 15.0,
+            "aspect_direction": "south",
+            "initial_fire_radius_m": 10.0,
+            "duration_hours": 8.0,
+            "ignition_lat": 17.4,
+            "ignition_lon": 78.5,
+        },
+        bbox=bbox,
+    )
+
+    meta = out.metadata
+    assert meta["fuel_type"] == "grass"
+    assert meta["fuel_moisture_pct"] == 8.0
+    assert meta["recent_rainfall_mm"] == 2.0
+    assert meta["initial_fire_radius_m"] == 10.0
+    assert meta["rate_of_spread_max_mh"] > 50.0
+    assert meta["flame_length_m"] > 0.5
+    assert meta["fire_danger_rating"] in ["Moderate", "High", "Very High", "Catastrophic / Extreme"]
+    assert len(out.frames) >= 18
+    # Frame 0 should contain the initial ignition core
+    f0 = np.array(out.frames[0])
+    assert np.sum(f0 > 0) > 0
 
 
 if __name__ == "__main__":
@@ -126,4 +236,6 @@ if __name__ == "__main__":
     test_wildfire_downwind_propagation()
     test_landslide_slope_dependence()
     test_cyclone_radial_wind_and_category()
+    test_cyclone_custom_direction_and_radius()
+    test_wildfire_rothermel_comprehensive_parameters()
     print("All simulation unit tests PASSED successfully!")
