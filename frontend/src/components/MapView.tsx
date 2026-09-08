@@ -16,6 +16,7 @@ import {
   IconLocationPin,
   IconTag,
   IconPencil,
+  IconTarget,
 } from './Icons';
 
 const Terrain3DViewer = lazy(() => import('./Terrain3DViewer'));
@@ -1248,8 +1249,9 @@ export default function MapView({
 
   // Render Cyclone Track Trajectory, Calm Eye Well, Spiral Rainband Inflow & Tactical Eye Marker on 2D Leaflet Map
   useEffect(() => {
-    if (!mapRef.current || !cycloneTrackLayerRef.current) return;
-    cycloneTrackLayerRef.current.clearLayers();
+    const trackLayer = cycloneTrackLayerRef.current;
+    if (!mapRef.current || !trackLayer) return;
+    trackLayer.clearLayers();
 
     if (!result || result.simulation?.disaster_type !== 'cyclone') return;
     const meta = (result.simulation as any)?.metadata;
@@ -1262,6 +1264,10 @@ export default function MapView({
     const forwardSpeed = meta?.forward_speed_kmh ?? 22;
     const rMaxKm = meta?.cyclone_radius_km ?? 35;
     const stormRadiusKm = meta?.storm_radius_km ?? 180;
+    const rGaleKm = stormRadiusKm * 0.75;
+    const rGaleMeters = rGaleKm * 1000;
+    const rMaxMeters = rMaxKm * 1000;
+    const eyeCalmMeters = rMaxMeters * 0.45;
 
     // Outer glow for track line
     L.polyline(latlngs, {
@@ -1269,7 +1275,7 @@ export default function MapView({
       weight: 6,
       opacity: 0.35,
       interactive: false,
-    }).addTo(cycloneTrackLayerRef.current);
+    }).addTo(trackLayer);
 
     // Dotted track path line
     L.polyline(latlngs, {
@@ -1277,8 +1283,8 @@ export default function MapView({
       weight: 3,
       opacity: 0.95,
       dashArray: '8, 6',
-    }).addTo(cycloneTrackLayerRef.current).bindTooltip(
-      `<strong>🌀 Cyclone Movement Track</strong><br/>Heading: ${dirDeg}° &bull; Speed: ${forwardSpeed} km/h<br/>Total Track: ${tracks.length} Forecast Intervals`,
+    }).addTo(trackLayer).bindTooltip(
+      `<strong>Cyclone Movement Track</strong><br/>Heading: ${dirDeg}° &bull; Speed: ${forwardSpeed} km/h<br/>Total Track: ${tracks.length} Forecast Intervals`,
       { sticky: true, className: 'custom-map-tooltip' }
     );
 
@@ -1287,14 +1293,17 @@ export default function MapView({
       const isStart = i === 0;
       const isEnd = i === tracks.length - 1;
       const wpColor = wpt.wind_kmh >= 209 ? '#f43f5e' : wpt.wind_kmh >= 154 ? '#fb923c' : wpt.wind_kmh >= 119 ? '#facc15' : '#38bdf8';
-      L.circleMarker([wpt.lat, wpt.lon], {
-        radius: isStart || isEnd ? 5.5 : 3.5,
+
+      const circle = L.circleMarker([wpt.lat, wpt.lon], {
+        radius: isStart || isEnd ? 6.5 : 4.5,
         color: '#ffffff',
         weight: 1.5,
         fillColor: wpColor,
         fillOpacity: 0.95,
-      }).addTo(cycloneTrackLayerRef.current!).bindTooltip(
-        `<strong>Waypoint ${wpt.time_h}h</strong><br/>Category: ${wpt.category || 'Storm'}<br/>Peak Wind: ${Math.round(wpt.wind_kmh)} km/h<br/>Pressure: ${wpt.pressure_hpa ? Math.round(wpt.pressure_hpa) + ' hPa' : 'N/A'}`,
+      }).addTo(trackLayer);
+
+      circle.bindTooltip(
+        `<strong>Forecast Interval +${wpt.time_h}h</strong><br/>Coords: ${wpt.lat.toFixed(3)}°N, ${wpt.lon.toFixed(3)}°E<br/>Wind: <strong>${Math.round(wpt.wind_kmh)} km/h</strong> (${wpt.category || 'Gale'})<br/>Pressure: ${Math.round(wpt.pressure_hpa || 0)} hPa`,
         { sticky: true, className: 'custom-map-tooltip' }
       );
     });
@@ -1302,39 +1311,34 @@ export default function MapView({
     // Pick the track point for the current simulation frame
     const frameIndex = Math.min(tracks.length - 1, Math.max(0, currentFrame));
     const activePt = tracks[frameIndex] || tracks[0];
-    const rMaxMeters = rMaxKm * 1000;
-    const eyeCalmMeters = rMaxMeters * 0.45;
-    const outerGaleMeters = stormRadiusKm * 1000;
 
-    // 1. Outer Storm Gale Radius Ring
+    // 2. Active Eyewall Maximum Wind Radii (Rmax) & Outer Gale Radius Ring
     L.circle([activePt.lat, activePt.lon], {
-      radius: outerGaleMeters,
+      radius: rGaleMeters,
       color: '#38bdf8',
       weight: 1.2,
-      opacity: 0.5,
-      fillColor: '#38bdf8',
-      fillOpacity: 0.03,
-      dashArray: '6, 8',
-    }).addTo(cycloneTrackLayerRef.current).bindTooltip(
-      `<strong>Outer Circulation Boundary</strong><br/>Radius: ${stormRadiusKm} km &bull; Outer Squalls (~35–50 km/h)<br/><span style="font-size:10.5px;color:#94a3b8;">Destructive hurricane damage is concentrated within Eyewall (${rMaxKm} km)</span>`,
+      opacity: 0.7,
+      fillColor: '#0369a1',
+      fillOpacity: 0.12,
+      dashArray: '4, 4',
+    }).addTo(trackLayer).bindTooltip(
+      `<strong>Outer Gale Wind Swath (R=${Math.round(rGaleKm)}km)</strong><br/>Sustained Winds &ge; 63 km/h<br/>Inflow Storm Area`,
       { sticky: true, className: 'custom-map-tooltip' }
     );
 
-    // 2. Outer Eyewall Radius Circle (Peak Wind Zone)
     L.circle([activePt.lat, activePt.lon], {
       radius: rMaxMeters,
       color: '#ef4444',
-      weight: 2.2,
+      weight: 2,
       opacity: 0.9,
-      fillColor: '#ef4444',
-      fillOpacity: 0.12,
-      dashArray: '5, 4',
-    }).addTo(cycloneTrackLayerRef.current).bindTooltip(
-      `<strong>Cyclone Eyewall (Rmax)</strong><br/>Radius: ${rMaxKm} km<br/>Peak Eyewall Wind: ${Math.round(activePt.wind_kmh || meta?.peak_wind_kmh)} km/h`,
+      fillColor: '#dc2626',
+      fillOpacity: 0.22,
+    }).addTo(trackLayer).bindTooltip(
+      `<strong>Eyewall Ring of Peak Destruction (Rmax=${Math.round(rMaxKm)}km)</strong><br/>Peak Winds: <strong>${Math.round(activePt.wind_kmh || meta?.peak_wind_kmh)} km/h</strong><br/>Maximum Storm Surge Potential: +${meta?.estimated_coastal_surge_m?.toFixed(1) || '2.5'}m`,
       { sticky: true, className: 'custom-map-tooltip' }
     );
 
-    // 3. Inner Calm Eye Well (Clear Sky cavity with low winds)
+    // 3. Calm Center Eye Core
     L.circle([activePt.lat, activePt.lon], {
       radius: eyeCalmMeters,
       color: '#ffffff',
@@ -1343,8 +1347,8 @@ export default function MapView({
       fillColor: '#0f172a',
       fillOpacity: 0.55,
       dashArray: '3, 3',
-    }).addTo(cycloneTrackLayerRef.current).bindTooltip(
-      `<strong>🌀 Calm Eye Core</strong><br/>Radius: ${Math.round(rMaxKm * 0.45)} km<br/>Pressure: ${activePt.pressure_hpa ? Math.round(activePt.pressure_hpa) + ' hPa' : meta?.central_pressure_hpa + ' hPa'}<br/>Condition: Calm Winds (< 30 km/h)`,
+    }).addTo(trackLayer).bindTooltip(
+      `<strong>Calm Eye Core</strong><br/>Radius: ${Math.round(rMaxKm * 0.45)} km<br/>Pressure: ${activePt.pressure_hpa ? Math.round(activePt.pressure_hpa) + ' hPa' : meta?.central_pressure_hpa + ' hPa'}<br/>Condition: Calm Winds (< 30 km/h)`,
       { sticky: true, className: 'custom-map-tooltip' }
     );
 
@@ -1352,42 +1356,40 @@ export default function MapView({
     const numSpiralArms = 3;
     const spiralPointsPerArm = 24;
     const cosLat = Math.cos((activePt.lat * Math.PI) / 180);
-    const bParam = 0.22;
 
     for (let arm = 0; arm < numSpiralArms; arm++) {
-      const armOffset = (arm * 2 * Math.PI) / numSpiralArms;
-      const armCoords: [number, number][] = [];
-      for (let s = 0; s < spiralPointsPerArm; s++) {
-        const theta = (s / spiralPointsPerArm) * Math.PI * 2.2;
-        const radKm = rMaxKm * 0.7 * Math.exp(bParam * theta);
-        if (radKm > stormRadiusKm * 1.05) break;
-        const totalAngle = theta + armOffset;
-        const dLat = (radKm / 111.32) * Math.cos(totalAngle);
-        const dLon = (radKm / (111.32 * Math.max(0.1, cosLat))) * Math.sin(totalAngle);
-        armCoords.push([activePt.lat + dLat, activePt.lon + dLon]);
+      const armOffset = (arm * (2 * Math.PI)) / numSpiralArms;
+      const spiralCoords: [number, number][] = [];
+
+      for (let p = 0; p < spiralPointsPerArm; p++) {
+        const frac = p / (spiralPointsPerArm - 1);
+        const rKm = rMaxKm * 0.5 + frac * (rGaleKm - rMaxKm * 0.5);
+        const theta = armOffset + frac * 2.8;
+        const dLat = (rKm / 111.0) * Math.cos(theta);
+        const dLon = (rKm / (111.0 * cosLat)) * Math.sin(theta);
+        spiralCoords.push([activePt.lat + dLat, activePt.lon + dLon]);
       }
-      if (armCoords.length > 3) {
-        L.polyline(armCoords, {
-          color: arm === 0 ? '#38bdf8' : '#c084fc',
-          weight: 1.8,
-          opacity: 0.65,
-          dashArray: '6, 5',
-          interactive: false,
-        }).addTo(cycloneTrackLayerRef.current);
-      }
+
+      L.polyline(spiralCoords, {
+        color: arm === 0 ? '#38bdf8' : '#818cf8',
+        weight: arm === 0 ? 2.5 : 1.8,
+        opacity: 0.75,
+        className: 'cyclone-spiral-arm-flow',
+      }).addTo(trackLayer);
     }
 
-    // 5. Forward Translation Vector Arrow (Heading Indicator)
-    const arrowDistKm = Math.max(18, rMaxKm * 0.75);
-    const headingRad = (dirDeg * Math.PI) / 180;
-    const arrowLat = activePt.lat + (arrowDistKm / 111.32) * Math.cos(headingRad);
-    const arrowLon = activePt.lon + (arrowDistKm / (111.32 * Math.max(0.1, cosLat))) * Math.sin(headingRad);
-    L.polyline([[activePt.lat, activePt.lon], [arrowLat, arrowLon]], {
-      color: '#38bdf8',
-      weight: 2.8,
+    // 5. Dynamic Storm Translation Vector (Forward Heading Arrow)
+    const forwardVecDistKm = Math.max(12, forwardSpeed * 1.5);
+    const radDir = ((90 - dirDeg) * Math.PI) / 180;
+    const headingLat = activePt.lat + (forwardVecDistKm / 111.0) * Math.sin(radDir);
+    const headingLon = activePt.lon + (forwardVecDistKm / (111.0 * cosLat)) * Math.cos(radDir);
+
+    L.polyline([[activePt.lat, activePt.lon], [headingLat, headingLon]], {
+      color: '#f59e0b',
+      weight: 3.5,
       opacity: 0.95,
-      dashArray: undefined,
-    }).addTo(cycloneTrackLayerRef.current);
+      dashArray: '5, 5',
+    }).addTo(trackLayer);
 
     // 6. Tactical Eye Center Icon Marker with Category Badge
     const catShort = (activePt.category || meta?.saffir_simpson_category || 'Cyclone').split(' ')[0];
@@ -1395,8 +1397,8 @@ export default function MapView({
       className: 'cyclone-eye-map-marker',
       html: `
         <div style="position:relative;display:flex;align-items:center;justify-content:center;">
-          <div style="width:30px;height:30px;border-radius:50%;background:radial-gradient(circle, #ef4444 0%, #991b1b 100%);border:2px solid #ffffff;display:flex;align-items:center;justify-content:center;font-size:15px;box-shadow:0 2px 8px rgba(0,0,0,0.6);">
-            🌀
+          <div style="width:30px;height:30px;border-radius:50%;background:radial-gradient(circle, #ef4444 0%, #991b1b 100%);border:2px solid #ffffff;display:flex;align-items:center;justify-content:center;box-shadow:0 2px 8px rgba(0,0,0,0.6);">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round"><path d="M12.5 8a4.5 4.5 0 0 0-4.5 4.5 4.5 4.5 0 0 0 4.5 4.5 4.5 4.5 0 0 0 4.5-4.5"/><path d="M4 12a8 8 0 0 1 14.5-4.5"/><path d="M20 12a8 8 0 0 1-14.5 4.5"/></svg>
           </div>
           <div style="position:absolute;top:-18px;left:50%;transform:translateX(-50%);white-space:nowrap;background:rgba(15,23,42,0.92);border:1px solid #38bdf8;padding:1px 6px;border-radius:4px;font-size:9.5px;font-weight:700;color:#38bdf8;box-shadow:0 2px 6px rgba(0,0,0,0.5);">
             ${catShort} • ${Math.round(activePt.wind_kmh || meta?.peak_wind_kmh)} km/h
@@ -1408,9 +1410,9 @@ export default function MapView({
     });
 
     L.marker([activePt.lat, activePt.lon], { icon: eyeIcon })
-      .addTo(cycloneTrackLayerRef.current)
+      .addTo(trackLayer)
       .bindTooltip(
-        `<strong>🌀 Cyclone Center (${activePt.time_h}h)</strong><br/>Category: ${activePt.category || meta?.saffir_simpson_category}<br/>Coords: ${activePt.lat.toFixed(3)}°N, ${activePt.lon.toFixed(3)}°E<br/>Central Pressure: ${activePt.pressure_hpa ? Math.round(activePt.pressure_hpa) + ' hPa' : meta?.central_pressure_hpa + ' hPa'}<br/>Peak Wind: ${Math.round(activePt.wind_kmh)} km/h<br/>Heading: ${dirDeg}° @ ${forwardSpeed} km/h`,
+        `<strong>Cyclone Center (${activePt.time_h}h)</strong><br/>Category: ${activePt.category || meta?.saffir_simpson_category}<br/>Coords: ${activePt.lat.toFixed(3)}°N, ${activePt.lon.toFixed(3)}°E<br/>Central Pressure: ${activePt.pressure_hpa ? Math.round(activePt.pressure_hpa) + ' hPa' : meta?.central_pressure_hpa + ' hPa'}<br/>Peak Wind: ${Math.round(activePt.wind_kmh)} km/h<br/>Heading: ${dirDeg}° @ ${forwardSpeed} km/h`,
         { sticky: true, className: 'custom-map-tooltip' }
       );
   }, [result, currentFrame]);
@@ -1541,7 +1543,7 @@ export default function MapView({
       {/* Floating Instructions Banner while picking ignition point on map */}
       {isPickingIgnition && (
         <div className="drawing-guide-banner" style={{ borderColor: 'rgba(249, 115, 22, 0.6)', background: 'rgba(15, 23, 42, 0.94)' }}>
-          <span className="drawing-guide-pulse" style={{ color: '#f97316' }}>🎯</span>
+          <span className="drawing-guide-pulse" style={{ color: '#f97316', display: 'inline-flex', alignItems: 'center' }}><IconTarget size={15} color="#f97316" /></span>
           <span>Click anywhere on the map to set the <strong>Wildfire Ignition Point</strong></span>
           <button className="drawing-guide-cancel" onClick={() => setIsPickingIgnition?.(false)}>Cancel</button>
         </div>

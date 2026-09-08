@@ -43,6 +43,27 @@ import {
   IconRoad,
   IconAlertTriangle,
   IconInsight,
+  IconSettings,
+  IconSparkles,
+  IconBolt,
+  IconWind,
+  IconCompass,
+  IconThermometer,
+  IconDroplet,
+  IconClock,
+  IconTarget,
+  IconKey,
+  IconFolder,
+  IconUser,
+  IconBot,
+  IconLightbulb,
+  IconEye,
+  IconEyeOff,
+  IconTree,
+  IconMountain,
+  IconPencil,
+  IconReset,
+  IconFlame,
 } from './components/Icons';
 
 // ─── Run History persistence (localStorage, quota-safe) ─────────────
@@ -243,7 +264,7 @@ function App() {
   }>>([
     {
       role: 'assistant',
-      text: '🤖 Welcome to Gen AI Mode powered by Gemini 3.5 Flash-Lite. Enter any disaster scenario in natural language to extract physical parameters and run the simulation.',
+      text: 'Welcome to Gen AI Mode powered by Gemini 3.5 Flash-Lite. Enter any disaster scenario in natural language to extract physical parameters and run the simulation.',
       timestamp: 'Ready',
     },
   ]);
@@ -661,7 +682,7 @@ function App() {
         ...prev,
         {
           role: 'assistant',
-          text: `⚠️ Error: ${errMsg}. Please try another prompt.`,
+          text: `Error: ${errMsg}. Please try another prompt.`,
           timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
         },
       ]);
@@ -772,17 +793,17 @@ function App() {
   const formatSimulationTime = (rawVal: number) => {
     const converted = convertTimeToEffective(rawVal);
     if (effectiveUnit === 'seconds') {
-      return `T+${Math.round(converted)}s`;
+      return `T+${Math.round(converted).toString().padStart(2, '0')}s`;
     }
     if (effectiveUnit === 'minutes') {
-      const mins = Math.round(converted * 10) / 10;
-      return `T+${mins % 1 === 0 ? mins.toFixed(0) : mins.toFixed(1)}m`;
+      const mins = Math.floor(converted);
+      const secs = Math.round((converted - mins) * 60);
+      return `T+${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}m`;
     }
     const totalMinutes = Math.round(converted * 60);
     const hrs = Math.floor(totalMinutes / 60);
     const mins = totalMinutes % 60;
-    if (hrs === 0) return `T+${mins}m`;
-    return mins > 0 ? `T+${hrs}h ${mins}m` : `T+${hrs}h`;
+    return `T+${hrs.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')}h`;
   };
 
   const formatTickLabel = (rawVal: number) => {
@@ -1147,7 +1168,11 @@ function App() {
                 title="Cycle playback speed (0.5x slow-mo, 1x normal, 2x fast, 4x rapid)"
               >
                 <span>{playSpeed}x</span>
-                <span className="speed-chevron">⌄</span>
+                <span className="speed-chevron" style={{ display: 'inline-flex', alignItems: 'center' }}>
+                  <svg width="7" height="5" viewBox="0 0 10 6" fill="currentColor">
+                    <path d="M0 0l5 6 5-6z" />
+                  </svg>
+                </span>
               </div>
             </div>
           </div>
@@ -1184,14 +1209,11 @@ function App() {
             <div className="modern-scenario-card">
               <div className="scenario-card-header">
                 <span className="scenario-card-label">Scenario</span>
-{result && (result as any).is_synthetic && (
+                {result && (result as any).is_synthetic && (
                   <span className="synthetic-badge" title="Live sources failed; showing modeled fallback">
                     Synthetic fallback data
                   </span>
                 )}
-                <button className="scenario-change-btn" onClick={() => setShowScenarioModal(true)}>
-                  Change
-                </button>
               </div>
 
               {/* Mode Toggle: Manual Sliders vs Gen AI Assistant */}
@@ -1204,7 +1226,7 @@ function App() {
                   onClick={() => setSidebarInputMode('manual')}
                   title="Configure disaster parameters manually using interactive sliders"
                 >
-                  <span className="scenario-mode-tab-icon">⚙️</span>
+                  <span className="scenario-mode-tab-icon"><IconSettings size={13} /></span>
                   <span>Manual Sliders</span>
                 </button>
                 <button
@@ -1215,7 +1237,7 @@ function App() {
                   onClick={() => setSidebarInputMode('gen_ai')}
                   title="Use Gemini Flash-Lite to describe scenario in natural language and simulate automatically"
                 >
-                  <span className="scenario-mode-tab-icon">✨</span>
+                  <span className="scenario-mode-tab-icon"><IconSparkles size={13} /></span>
                   <span>Gen AI Mode</span>
                 </button>
               </div>
@@ -1301,7 +1323,7 @@ function App() {
                     >
                       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '6px' }}>
                         <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                          <span style={{ fontSize: '15px' }}>🌀</span>
+                          <IconCyclone size={15} color={cycloneCategoryInfo.color} />
                           <span style={{ fontWeight: 700, fontSize: '12.5px', color: cycloneCategoryInfo.color }}>
                             {cycloneCategoryInfo.cat}
                           </span>
@@ -1416,7 +1438,7 @@ function App() {
                               cursor: 'pointer',
                             }}
                           >
-                            ⚡ Auto-Sync
+                            <IconBolt size={10} style={{ marginRight: 3 }} /> Auto-Sync
                           </button>
                           <span className="scenario-slider-val">{centralPressure} hPa</span>
                         </div>
@@ -1543,7 +1565,7 @@ function App() {
                         onClick={() => setOpenWildfireSection(openWildfireSection === 'ignition' ? null : 'ignition')}
                       >
                         <span className="wildfire-accordion-title">
-                          <span>📍</span>
+                          <IconLocationPin size={13} color="#f97316" />
                           <span>Ignition &amp; Fire Origin</span>
                         </span>
                         <div style={{ display: 'flex', alignItems: 'center' }}>
@@ -1562,7 +1584,7 @@ function App() {
                             className={`wildfire-pick-btn ${isPickingIgnition ? 'wildfire-pick-btn--active' : ''}`}
                             onClick={() => setIsPickingIgnition(!isPickingIgnition)}
                           >
-                            <span>{isPickingIgnition ? '🎯' : '📍'}</span>
+                            <span>{isPickingIgnition ? <IconTarget size={13} color="#f97316" /> : <IconLocationPin size={13} />}</span>
                             <span>
                               {isPickingIgnition
                                 ? 'Tap anywhere on map to place fire origin...'
@@ -1589,13 +1611,15 @@ function App() {
                                 setIgnitionLon(Number(((bbox.east + bbox.west) / 2).toFixed(4)));
                               }}
                             >
-                              📍 Reset to AOI Center
+                              <IconReset size={11} style={{ marginRight: 4 }} /> Reset to AOI Center
                             </button>
                           )}
 
                           <div className="scenario-slider-row" style={{ marginTop: 2 }}>
                             <div className="scenario-slider-meta">
-                              <span>🔥 Initial Fire Radius</span>
+                              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                                <IconFlame size={12} color="#f97316" /> Initial Fire Radius
+                              </span>
                               <span className="scenario-slider-val">{initialFireRadiusM} m</span>
                             </div>
                             <input
@@ -1607,7 +1631,6 @@ function App() {
                               value={initialFireRadiusM}
                               onChange={(e) => setInitialFireRadiusM(Number(e.target.value))}
                             />
-                            <div className="wildfire-helper-text">Starting fire footprint at t=0h (seeds ignition cells)</div>
                           </div>
                         </div>
                       )}
@@ -1621,7 +1644,7 @@ function App() {
                         onClick={() => setOpenWildfireSection(openWildfireSection === 'weather' ? null : 'weather')}
                       >
                         <span className="wildfire-accordion-title">
-                          <span>🌬️</span>
+                          <IconWind size={13} color="#38bdf8" />
                           <span>Atmospheric &amp; Weather</span>
                         </span>
                         <div style={{ display: 'flex', alignItems: 'center' }}>
@@ -1637,7 +1660,9 @@ function App() {
                           {/* Wind Speed */}
                           <div className="scenario-slider-row">
                             <div className="scenario-slider-meta">
-                              <span>🌬️ Wind Speed</span>
+                              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                                <IconWind size={12} color="#38bdf8" /> Wind Speed
+                              </span>
                               <span className="scenario-slider-val">{wildfireWindSpeed} km/h</span>
                             </div>
                             <input
@@ -1649,13 +1674,14 @@ function App() {
                               value={wildfireWindSpeed}
                               onChange={(e) => setWildfireWindSpeed(Number(e.target.value))}
                             />
-                            <div className="wildfire-helper-text">Rothermel wind propagation factor φw &amp; Huygens elongation</div>
                           </div>
 
                           {/* Wind Direction */}
                           <div className="scenario-slider-row">
                             <div className="scenario-slider-meta">
-                              <span>🧭 Wind Direction</span>
+                              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                                <IconCompass size={12} color="#38bdf8" /> Wind Direction
+                              </span>
                               <span className="scenario-slider-val">{getCompassLabel(wildfireWindDir)}</span>
                             </div>
                             <input
@@ -1702,7 +1728,9 @@ function App() {
                           {/* Air Temperature */}
                           <div className="scenario-slider-row">
                             <div className="scenario-slider-meta">
-                              <span>🌡️ Temperature</span>
+                              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                                <IconThermometer size={12} color="#f97316" /> Temperature
+                              </span>
                               <span className="scenario-slider-val">{wildfireTempC} °C</span>
                             </div>
                             <input
@@ -1714,13 +1742,14 @@ function App() {
                               value={wildfireTempC}
                               onChange={(e) => setWildfireTempC(Number(e.target.value))}
                             />
-                            <div className="wildfire-helper-text">Accelerates fine fuel desiccation and fire convective column</div>
                           </div>
 
                           {/* Relative Humidity */}
                           <div className="scenario-slider-row">
                             <div className="scenario-slider-meta">
-                              <span>💧 Relative Humidity</span>
+                              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                                <IconDroplet size={12} color="#38bdf8" /> Relative Humidity
+                              </span>
                               <span className="scenario-slider-val">{wildfireHumidityPct} %</span>
                             </div>
                             <input
@@ -1732,13 +1761,14 @@ function App() {
                               value={wildfireHumidityPct}
                               onChange={(e) => setWildfireHumidityPct(Number(e.target.value))}
                             />
-                            <div className="wildfire-helper-text">Drier air (&lt;30%) drastically lowers fuel moisture equilibrium</div>
                           </div>
 
                           {/* Recent Rainfall */}
                           <div className="scenario-slider-row">
                             <div className="scenario-slider-meta">
-                              <span>🌧️ Recent Rainfall</span>
+                              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                                <IconFlood size={12} color="#38bdf8" /> Recent Rainfall
+                              </span>
                               <span className="scenario-slider-val">{recentRainfallMm} mm</span>
                             </div>
                             <input
@@ -1750,13 +1780,14 @@ function App() {
                               value={recentRainfallMm}
                               onChange={(e) => setRecentRainfallMm(Number(e.target.value))}
                             />
-                            <div className="wildfire-helper-text">Pre-fire moisture wetting dampens flame intensity</div>
                           </div>
 
                           {/* Duration */}
                           <div className="scenario-slider-row">
                             <div className="scenario-slider-meta">
-                              <span>⏱️ Burn Duration</span>
+                              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                                <IconClock size={12} color="#94a3b8" /> Burn Duration
+                              </span>
                               <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                                 <span className="scenario-slider-val">
                                   {durationHours < 1
@@ -1827,11 +1858,6 @@ function App() {
                                 onChange={(e) => setDurationHours(Number(e.target.value))}
                               />
                             )}
-                            <div className="wildfire-helper-text">
-                              {wildfireDurationUnit === 'minutes'
-                                ? 'Fine-grained minute control — simulation engine auto-scales frames for smooth animation'
-                                : 'Hour-level duration — each frame captures ~2–3 min of real fire advance'}
-                            </div>
                           </div>
                         </div>
                       )}
@@ -1845,14 +1871,14 @@ function App() {
                         onClick={() => setOpenWildfireSection(openWildfireSection === 'fuel' ? null : 'fuel')}
                       >
                         <span className="wildfire-accordion-title">
-                          <span>🌿</span>
+                          <IconTree size={13} color="#22c55e" />
                           <span>Fuel &amp; Topography (DEM)</span>
                         </span>
                         <div style={{ display: 'flex', alignItems: 'center' }}>
                           <span className="wildfire-accordion-badge">
                             {wildfireMeta?.slope_deg !== undefined
-                              ? `⛰️ ${wildfireMeta.slope_deg}° • ${wildfireMeta.fuel_type || 'Auto'}`
-                              : '🤖 Auto-Decided from DEM'}
+                              ? `${wildfireMeta.slope_deg}° • ${wildfireMeta.fuel_type || 'Auto'}`
+                              : 'Auto-Decided from DEM'}
                           </span>
                           <span className="wildfire-accordion-chevron">▶</span>
                         </div>
@@ -1862,22 +1888,15 @@ function App() {
                         <div className="wildfire-accordion-body">
                           <div className="wildfire-auto-dem-card">
                             <div className="wildfire-auto-dem-header">
-                              <span className="wildfire-auto-dem-badge">⚡ AUTOMATED DEM ENGINE ACTIVE</span>
+                              <span className="wildfire-auto-dem-badge"><IconBolt size={10} style={{ marginRight: 3 }} /> AUTOMATED DEM ENGINE ACTIVE</span>
                               <span className="wildfire-auto-dem-tag">No manual input required</span>
                             </div>
-                            <p className="wildfire-auto-dem-desc">
-                              The simulation engine automatically calculates per-cell terrain slope gradients, directional solar aspect, and vegetation fuel beds directly from the 3D Digital Elevation Model (DEM) and weather conditions.
-                            </p>
-
                             <div className="wildfire-dem-features-grid">
                               {/* 1. Slope */}
                               <div className="wildfire-dem-feature-item">
                                 <div className="wildfire-dem-feature-title">
-                                  <span>⛰️</span>
+                                  <IconMountain size={12} color="#a78bfa" />
                                   <strong>Slope Gradients (∇z)</strong>
-                                </div>
-                                <div className="wildfire-dem-feature-body">
-                                  Per-cell 90m gradient calculated via spatial elevation differentials. Uphill spread accelerates dramatically (φs = 5.275·tan²θ) and retards downhill.
                                 </div>
                                 {wildfireMeta?.slope_deg !== undefined && (
                                   <div className="wildfire-dem-feature-stat">
@@ -1889,11 +1908,8 @@ function App() {
                               {/* 2. Aspect */}
                               <div className="wildfire-dem-feature-item">
                                 <div className="wildfire-dem-feature-title">
-                                  <span>🧭</span>
+                                  <IconCompass size={12} color="#38bdf8" />
                                   <strong>Solar Aspect Vector</strong>
-                                </div>
-                                <div className="wildfire-dem-feature-body">
-                                  Per-cell directional exposure vector atan2(-∂z/∂x, ∂z/∂y). South &amp; West facing slopes receive increased solar drying and fuel desiccation.
                                 </div>
                                 {wildfireMeta?.aspect_direction && (
                                   <div className="wildfire-dem-feature-stat">
@@ -1905,11 +1921,8 @@ function App() {
                               {/* 3. Fuel Bed */}
                               <div className="wildfire-dem-feature-item">
                                 <div className="wildfire-dem-feature-title">
-                                  <span>🌿</span>
+                                  <IconTree size={12} color="#22c55e" />
                                   <strong>Vegetation Fuel Bed</strong>
-                                </div>
-                                <div className="wildfire-dem-feature-body">
-                                  Heterogeneous Rothermel model inferred from terrain relief: timber forest canopy on ridges (&gt;16°), chaparral shrubs on mid-slopes, dry grass on lowlands.
                                 </div>
                                 {wildfireMeta?.fuel_type_name && (
                                   <div className="wildfire-dem-feature-stat">
@@ -1921,11 +1934,8 @@ function App() {
                               {/* 4. Equilibrium Moisture */}
                               <div className="wildfire-dem-feature-item">
                                 <div className="wildfire-dem-feature-title">
-                                  <span>💦</span>
+                                  <IconDroplet size={12} color="#38bdf8" />
                                   <strong>Equilibrium Moisture</strong>
-                                </div>
-                                <div className="wildfire-dem-feature-body">
-                                  Natural equilibrium fuel moisture computed dynamically from temperature ({wildfireTempC}°C), humidity ({wildfireHumidityPct}%), and rainfall ({recentRainfallMm}mm).
                                 </div>
                                 {wildfireMeta?.fuel_moisture_pct !== undefined && (
                                   <div className="wildfire-dem-feature-stat">
@@ -1935,10 +1945,6 @@ function App() {
                               </div>
                             </div>
 
-                            <div className="wildfire-dem-gis-note">
-                              🏘️ <strong>GIS Infrastructure Integration</strong>: Building footprints and road corridors automatically intersect the continuous burn perimeter to quantify exposed assets.
-                            </div>
-
                             {/* Optional Manual Overrides Toggle */}
                             <div style={{ marginTop: '2px' }}>
                               <button
@@ -1946,7 +1952,9 @@ function App() {
                                 className="wildfire-override-toggle-btn"
                                 onClick={() => setShowManualFuelOverrides(!showManualFuelOverrides)}
                               >
-                                <span>{showManualFuelOverrides ? '▲ Hide Manual Overrides' : '⚙️ Advanced Overrides (Optional)'}</span>
+                                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                                  {showManualFuelOverrides ? '▲ Hide Manual Overrides' : <><IconSettings size={12} /> Advanced Overrides (Optional)</>}
+                                </span>
                                 <span style={{ fontSize: '10px', color: '#38bdf8' }}>
                                   {showManualFuelOverrides ? 'Manual Mode' : 'Using Automated DEM analysis'}
                                 </span>
@@ -2062,9 +2070,6 @@ function App() {
                         onChange={(e) => setDurationHours(Number(e.target.value))}
                       />
                     </div>
-                    <div style={{ fontSize: 11, color: '#94a3b8', padding: '2px 0 4px 0' }}>
-                      ⏱️ Catastrophic Runout Event: 15 minutes
-                    </div>
                   </>
                 )}
               </div>
@@ -2078,18 +2083,6 @@ function App() {
             </>
           ) : (
             <div className="genai-scenario-panel">
-              {/* Top Meta Bar: Auto-Run Toggle */}
-              <div className="genai-top-meta-row" style={{ justifyContent: 'flex-end', alignItems: 'center' }}>
-                <label className="genai-autorun-label" title="Automatically trigger physics simulation after Gemini assigns parameters">
-                  <input
-                    type="checkbox"
-                    checked={aiAutoRun}
-                    onChange={(e) => setAiAutoRun(e.target.checked)}
-                  />
-                  <span>Auto-run simulation</span>
-                </label>
-              </div>
-
               {!aiKeyStatus.configured && (
                 <div
                   style={{
@@ -2105,7 +2098,9 @@ function App() {
                     color: '#fde68a',
                   }}
                 >
-                  <span>⚠️ Gemini API key not configured</span>
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                    <IconAlertTriangle size={13} color="#f59e0b" /> Gemini API key not configured
+                  </span>
                   <button
                     type="button"
                     onClick={() => setSettingsPageOpen(true)}
@@ -2130,7 +2125,9 @@ function App() {
                 {aiChatHistory.map((msg, idx) => (
                   <div key={idx} className={`genai-chat-bubble genai-chat-bubble--${msg.role}`}>
                     <div className="genai-bubble-header">
-                      <span>{msg.role === 'user' ? '👤 You' : '🤖 Gemini Assistant'}</span>
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                        {msg.role === 'user' ? <><IconUser size={12} /> You</> : <><IconBot size={12} /> Gemini Assistant</>}
+                      </span>
                       <span className="genai-msg-time">{msg.timestamp}</span>
                     </div>
                     <div className="genai-bubble-content">{msg.text}</div>
@@ -2168,7 +2165,7 @@ function App() {
                             }
                             disabled={loading}
                           >
-                            🚀 Run Simulation
+                            <IconPlay size={11} color="#ffffff" style={{ marginRight: 4 }} /> Run Simulation
                           </button>
                           <button
                             type="button"
@@ -2176,7 +2173,7 @@ function App() {
                             onClick={() => setSidebarInputMode('manual')}
                             title="Switch to Manual Mode to inspect or adjust these parameters on the sliders"
                           >
-                            ✏️ Tweak Sliders
+                            <IconPencil size={11} style={{ marginRight: 4 }} /> Tweak Sliders
                           </button>
                         </div>
                       </div>
@@ -2187,7 +2184,9 @@ function App() {
                 {aiChatLoading && (
                   <div className="genai-chat-bubble genai-chat-bubble--assistant">
                     <div className="genai-bubble-header">
-                      <span>🤖 Gemini Assistant</span>
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                        <IconBot size={12} /> Gemini Assistant
+                      </span>
                       <span className="genai-msg-time">Thinking...</span>
                     </div>
                     <div className="genai-bubble-content" style={{ display: 'flex', alignItems: 'center', gap: 6, color: '#38bdf8' }}>
@@ -2201,13 +2200,15 @@ function App() {
               {/* Suggested Prompts (When history is short) */}
               {aiChatHistory.length <= 2 && (
                 <div className="genai-suggestions-box">
-                  <div className="genai-suggestions-title">💡 Quick Scenario Prompts:</div>
+                  <div className="genai-suggestions-title" style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                    <IconLightbulb size={13} color="#f59e0b" /> Quick Scenario Prompts:
+                  </div>
                   <div className="genai-suggestions-pills">
                     {[
-                      '🌊 Flash Flood: 350mm rain over 8 hours with 2.0m storm surge',
-                      '⚡ Mw 7.4 Major Earthquake: 10km shallow hypocenter',
-                      '🔥 Wildfire: 50 km/h wind heading SE, 38°C dry timber',
-                      '⛰️ Landslide: Heavy continuous rain on steep hillside slopes',
+                      'Flash Flood: 350mm rain over 8 hours with 2.0m storm surge',
+                      'Mw 7.4 Major Earthquake: 10km shallow hypocenter',
+                      'Wildfire: 50 km/h wind heading SE, 38°C dry timber',
+                      'Landslide: Heavy continuous rain on steep hillside slopes',
                     ].map((suggestion, sIdx) => (
                       <button
                         key={sIdx}
@@ -2252,11 +2253,8 @@ function App() {
                       disabled={aiChatLoading || !aiChatPrompt.trim()}
                       title="Submit prompt to Gemini 3.5 Flash-Lite"
                     >
-                    {aiChatLoading ? 'Parsing…' : '✨ Generate'}
+                    {aiChatLoading ? 'Parsing…' : <><IconSparkles size={12} style={{ marginRight: 4 }} /> Generate</>}
                   </button>
-                </div>
-                <div className="genai-helper-hint">
-                  Press Enter ↵ to send • Parameters sync directly with manual sliders
                 </div>
               </form>
             </div>
@@ -2578,6 +2576,31 @@ function App() {
               </div>
             </div>
 
+            {/* Simulation Automation */}
+            <div className="modal-section-title" style={{ marginTop: '28px' }}>Simulation Automation</div>
+            <div className="settings-row">
+              <div className="settings-row-text">
+                <div className="settings-row-title"><span>Auto-run simulation</span></div>
+                <div className="settings-row-sub">Automatically trigger physics simulation immediately after Gen AI extracts parameters from prompts.</div>
+              </div>
+              <div className="settings-pill-group" role="group" aria-label="Auto-run simulation">
+                <button
+                  type="button"
+                  className={`settings-pill ${aiAutoRun ? 'settings-pill--active' : ''}`}
+                  onClick={() => setAiAutoRun(true)}
+                >
+                  Enabled
+                </button>
+                <button
+                  type="button"
+                  className={`settings-pill ${!aiAutoRun ? 'settings-pill--active' : ''}`}
+                  onClick={() => setAiAutoRun(false)}
+                >
+                  Disabled
+                </button>
+              </div>
+            </div>
+
             {/* Google Gemini AI API Key Configuration */}
             <div className="modal-section-title" style={{ marginTop: '28px' }}>AI Configuration (Google Gemini)</div>
             <div
@@ -2595,7 +2618,8 @@ function App() {
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '16px' }}>
                 <div className="settings-row-text" style={{ flex: 1 }}>
                   <div className="settings-row-title" style={{ fontSize: '14.5px', color: '#f8fafc', display: 'flex', alignItems: 'center', gap: '8px' }}>
-                    <span>⚡ Google Gemini 3.5 Flash-Lite API Key</span>
+                    <IconBolt size={14} color="#f59e0b" />
+                    <span>Google Gemini 3.5 Flash-Lite API Key</span>
                   </div>
                   <div className="settings-row-sub" style={{ marginTop: '4px', fontSize: '12px', color: '#94a3b8' }}>
                     Powers natural language scenario extraction and grounded AI post-disaster analysis. The key is verified and stored in <code>backend/.env</code>.
@@ -2657,7 +2681,7 @@ function App() {
                     }}
                     title={showAiKeyText ? 'Hide API Key' : 'Show API Key'}
                   >
-                    {showAiKeyText ? '🙈' : '👁️'}
+                    {showAiKeyText ? <IconEyeOff size={14} /> : <IconEye size={14} />}
                   </button>
                 </div>
                 <button
@@ -2700,7 +2724,7 @@ function App() {
               )}
 
               <div style={{ fontSize: '11.5px', color: '#64748b', lineHeight: 1.6, borderTop: '1px solid rgba(255,255,255,0.06)', paddingTop: '10px' }}>
-                🔑 <strong>Get your API Key</strong>: Generate a free key from{' '}
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><IconKey size={12} color="#38bdf8" /> <strong>Get your API Key</strong>:</span> Generate a free key from{' '}
                 <a
                   href="https://aistudio.google.com/apikey"
                   target="_blank"
@@ -2710,7 +2734,7 @@ function App() {
                   Google AI Studio (aistudio.google.com/apikey)
                 </a>.
                 <br />
-                📁 <strong>Alternative</strong>: You can also set it manually in <code>backend/.env</code> as <code>GEMINI_API_KEY=&quot;AIzaSy...&quot;</code> or export it in your terminal.
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, marginTop: 4 }}><IconFolder size={12} color="#94a3b8" /> <strong>Alternative</strong>:</span> You can also set it manually in <code>backend/.env</code> as <code>GEMINI_API_KEY=&quot;AIzaSy...&quot;</code> or export it in your terminal.
               </div>
             </div>
           </div>

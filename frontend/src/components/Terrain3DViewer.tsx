@@ -1,6 +1,21 @@
 import { useEffect, useRef, useState, useMemo, useCallback } from 'react';
 import { SimulationResult, RoadFeature } from '../types';
-import { IconPlay, IconPause } from './Icons';
+import {
+  IconPlay,
+  IconPause,
+  IconReset,
+  IconMap,
+  IconTag,
+  IconBuilding,
+  IconSatellite,
+  IconExpand,
+  IconMinimize,
+  IconWave,
+  IconFlame,
+  IconCyclone,
+  IconMountain,
+  IconEarthquake,
+} from './Icons';
 
 interface Terrain3DViewerProps {
   result: SimulationResult;
@@ -220,7 +235,7 @@ function TileSatelliteCanvas({
       ctx.fillStyle = '#38bdf8';
       ctx.font = '600 11px "JetBrains Mono", monospace';
       ctx.textAlign = 'center';
-      ctx.fillText('🛰️ ACQUIRING OPTICAL SATELLITE...', W / 2, H / 2);
+      ctx.fillText('ACQUIRING OPTICAL SATELLITE...', W / 2, H / 2);
     }
 
     // Optical tactical crosshair in center
@@ -1596,7 +1611,7 @@ export default function Terrain3DViewer({
       const catShort = category.includes('Category') ? category.split(' ')[0] + ' ' + category.split(' ')[1] : category;
       const pcVal = meta.central_pressure_hpa ? Math.round(meta.central_pressure_hpa) : 945;
       const surgeVal = meta.estimated_coastal_surge_m ? Number(meta.estimated_coastal_surge_m).toFixed(1) : '2.5';
-      const line1 = `🌀 ${catShort} • ${Math.round(curWindKmh)} km/h • ${pcVal} hPa`;
+      const line1 = `${catShort} • ${Math.round(curWindKmh)} km/h • ${pcVal} hPa`;
       const line2 = `Rmax ${Math.round(rMaxKm)}km • Heading ${Math.round(dirDeg)}° • Surge +${surgeVal}m`;
 
       ctx.font = '700 11px "JetBrains Mono", monospace';
@@ -1703,7 +1718,7 @@ export default function Terrain3DViewer({
         // Tactical 3D HUD Tag for Ignition Origin
         const hudX = pTop.x;
         const hudY = pTop.y - 14;
-        const ignLabel = `📍 IGNITION SOURCE: ${ignLat.toFixed(3)}°N, ${ignLon.toFixed(3)}°E (R=${initRadiusM}m)`;
+        const ignLabel = `IGNITION SOURCE: ${ignLat.toFixed(3)}°N, ${ignLon.toFixed(3)}°E (R=${initRadiusM}m)`;
         ctx.font = '700 9.5px "JetBrains Mono", monospace';
         const ignTextW = ctx.measureText(ignLabel).width;
         ctx.fillStyle = 'rgba(15, 23, 42, 0.88)';
@@ -1786,7 +1801,7 @@ export default function Terrain3DViewer({
         ctx.fill();
 
         // Telemetry HUD Card
-        const windLabel = `🌬️ WIND: ${wfWindSpeed} km/h • ${wfWindDir}° [${fuelTypeStr} • ${fireDanger}]`;
+        const windLabel = `WIND: ${wfWindSpeed} km/h • ${wfWindDir}° [${fuelTypeStr} • ${fireDanger}]`;
         ctx.font = '700 9px "JetBrains Mono", monospace';
         const windTextW = ctx.measureText(windLabel).width;
         ctx.fillStyle = 'rgba(10, 15, 29, 0.88)';
@@ -2472,11 +2487,11 @@ export default function Terrain3DViewer({
 
   // Dynamic labels for physics button & timeline description
   const physicsLabel = useMemo(() => {
-    if (hazardType === 'wildfire') return '🔥 Flames';
-    if (hazardType === 'earthquake') return '⚡ Seismic';
-    if (hazardType === 'cyclone') return '🌀 Vortex';
-    if (hazardType === 'landslide') return '⛰️ Mudflow';
-    return '🌊 Waves';
+    if (hazardType === 'wildfire') return 'Flames';
+    if (hazardType === 'earthquake') return 'Seismic';
+    if (hazardType === 'cyclone') return 'Vortex';
+    if (hazardType === 'landslide') return 'Mudflow';
+    return 'Waves';
   }, [hazardType]);
 
   const timelineTitle = useMemo(() => {
@@ -2498,7 +2513,7 @@ export default function Terrain3DViewer({
               onClick={resetCamera}
               title="Reset camera angles and zoom"
             >
-              ↺ Reset View
+              <IconReset size={13} style={{ marginRight: 4 }} /> Reset View
             </button>
 
             <button
@@ -2506,7 +2521,7 @@ export default function Terrain3DViewer({
               onClick={() => setShow2DReference((v) => !v)}
               title="Toggle 2D Area Reference map pane"
             >
-              🗺️ {show2DReference ? 'Hide 2D Map' : 'Show 2D Map'}
+              <IconMap size={13} style={{ marginRight: 4 }} /> {show2DReference ? 'Hide 2D Map' : 'Show 2D Map'}
             </button>
 
             <button
@@ -2518,7 +2533,7 @@ export default function Terrain3DViewer({
               }}
               title="Cycle 3D tile corner micro-label: Tile # -> Elevation -> Live Hazard -> Off"
             >
-              🏷️ {tileNumberMode === 'id' ? 'Tile #' : tileNumberMode === 'elev' ? 'Elev' : tileNumberMode === 'hazard' ? 'Hazard' : 'Tiles: Off'}
+              <IconTag size={13} style={{ marginRight: 4 }} /> {tileNumberMode === 'id' ? 'Tile #' : tileNumberMode === 'elev' ? 'Elev' : tileNumberMode === 'hazard' ? 'Hazard' : 'Tiles: Off'}
             </button>
 
             <button
@@ -2526,7 +2541,7 @@ export default function Terrain3DViewer({
               onClick={() => setShowBuildings((v) => !v)}
               title={showBuildings ? 'Hide building spires (show terrain plane only)' : 'Show 3D buildings'}
             >
-              🏢 {showBuildings ? 'Buildings: ON' : 'Buildings: OFF'}
+              <IconBuilding size={13} style={{ marginRight: 4 }} /> {showBuildings ? 'Buildings: ON' : 'Buildings: OFF'}
             </button>
 
             <button
@@ -2540,7 +2555,7 @@ export default function Terrain3DViewer({
               }}
               title="Select a tile & show floating satellite inspection at height"
             >
-              🛰️ {selectedTile ? `Sat: Tile #${selectedTileData?.tileId ?? ''}` : 'Tile Satellite'}
+              <IconSatellite size={13} style={{ marginRight: 4 }} /> {selectedTile ? `Sat: Tile #${selectedTileData?.tileId ?? ''}` : 'Tile Satellite'}
             </button>
 
             <button
@@ -2548,7 +2563,7 @@ export default function Terrain3DViewer({
               onClick={() => setIsFullscreen((v) => !v)}
               title={isFullscreen ? 'Exit full screen (revert to windowed modal)' : 'Expand to full screen'}
             >
-              {isFullscreen ? '🗗 Windowed' : '⛶ Fullscreen'}
+              {isFullscreen ? <><IconMinimize size={13} style={{ marginRight: 4 }} /> Windowed</> : <><IconExpand size={13} style={{ marginRight: 4 }} /> Fullscreen</>}
             </button>
 
             <button className="terrain3d-btn terrain3d-btn--close" onClick={onClose} title="Exit 3D Mode">
@@ -2577,7 +2592,7 @@ export default function Terrain3DViewer({
               {/* 2. Satellite 2D View of the Same Map */}
               <div className="terrain3d-snapshot-section" style={{ marginTop: 6 }}>
                 <div className="terrain3d-snapshot-title" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                  <span>🛰️ Satellite 2D View</span>
+                     <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}><IconSatellite size={13} color="#38bdf8" /> Satellite 2D View</span>
                   <span style={{ fontSize: 9, background: 'rgba(56, 189, 248, 0.2)', color: '#38bdf8', padding: '1px 6px', borderRadius: 4, textTransform: 'none' }}>ArcGIS World Imagery</span>
                 </div>
                 <SatelliteAreaSnapshot result={result} currentFrame={Math.round(animFrame)} hazardType={hazardType} />
@@ -2635,7 +2650,7 @@ export default function Terrain3DViewer({
                 >
                   <div className="terrain3d-sat-card-header">
                     <div className="terrain3d-sat-card-title">
-                      <span className="terrain3d-sat-card-icon">🛰️</span>
+                      <span className="terrain3d-sat-card-icon"><IconSatellite size={16} color="#38bdf8" /></span>
                       <div>
                         <div className="terrain3d-sat-card-heading">Tile #{selectedTileData.tileId} Aerial Recon</div>
                         <div className="terrain3d-sat-card-sub">
@@ -2670,7 +2685,7 @@ export default function Terrain3DViewer({
                   {/* Fixed Satellite Altitude Info */}
                   <div className="terrain3d-sat-card-alt-box">
                     <div className="terrain3d-sat-alt-header">
-                      <span>🛰️ Satellite Height (Altitude):</span>
+                      <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}><IconSatellite size={13} color="#38bdf8" /> Satellite Height (Altitude):</span>
                       <strong className="terrain3d-sat-alt-val">+85 meters</strong>
                     </div>
                   </div>
@@ -2815,7 +2830,18 @@ export default function Terrain3DViewer({
                   title={`Toggle real-time ${hazardType} physics simulation`}
                   onMouseDown={(e) => e.stopPropagation()}
                 >
-                  {physicsLabel}: {physicsEnabled ? 'ON' : 'OFF'}
+                  {hazardType === 'wildfire' ? (
+                    <IconFlame size={13} color="currentColor" />
+                  ) : hazardType === 'earthquake' ? (
+                    <IconEarthquake size={13} color="currentColor" />
+                  ) : hazardType === 'landslide' ? (
+                    <IconMountain size={13} color="currentColor" />
+                  ) : hazardType === 'cyclone' ? (
+                    <IconCyclone size={13} color="currentColor" />
+                  ) : (
+                    <IconWave size={13} color="currentColor" />
+                  )}
+                  <span>{physicsLabel}: {physicsEnabled ? 'ON' : 'OFF'}</span>
                 </button>
               </div>
             </div>
