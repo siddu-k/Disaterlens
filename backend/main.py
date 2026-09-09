@@ -42,7 +42,7 @@ from db.spatial_store import (
 from satvision import detect_objects, compare_snapshots
 
 app = FastAPI(
-    title="DisasterLens API",
+    title="TerraLab API",
     description="Multi-hazard disaster simulation and impact-analysis platform",
     version="2.0.0",
 )
@@ -151,7 +151,7 @@ class BoundingBox(BaseModel):
 
 class SimulationRequest(BaseModel):
     bbox: BoundingBox
-    disaster_type: Literal["flood", "cyclone", "earthquake", "wildfire", "landslide"] = Field(default="flood", description="flood, earthquake, wildfire, landslide, cyclone")
+    disaster_type: Literal["flood", "earthquake", "wildfire", "landslide"] = Field(default="flood", description="flood, earthquake, wildfire, landslide")
     location_name: str = Field(default="Selected Area")
     start_points: Optional[List[Dict[str, float]]] = None
     # Flood parameters
@@ -257,11 +257,37 @@ class SetAiKeyRequest(BaseModel):
 class SatvisionDetectRequest(BaseModel):
     bbox: BoundingBox
     object_types: List[str] = Field(default=["building", "road"])
+    model: Optional[str] = "osm-vector"
 
 
 class SatvisionCompareRequest(BaseModel):
     snapshot_id_a: str
     snapshot_id_b: str
+
+
+class ResearchAnalyzeRequest(BaseModel):
+    lat: float
+    lon: Optional[float] = None
+    lng: Optional[float] = None
+    bbox: Optional[List[float]] = None
+    location_name: Optional[str] = "Selected Field"
+    model: Optional[str] = "gemini-3.5-flash-lite"
+    api_key: Optional[str] = None
+    optical_cv_context: Optional[Dict[str, Any]] = None
+
+    def resolved_lon(self) -> float:
+        if self.lon is not None:
+            return self.lon
+        if self.lng is not None:
+            return self.lng
+        return 0.0
+
+
+class ResearchChatRequest(BaseModel):
+    question: str
+    context: Optional[str] = "General"
+    model: Optional[str] = "gemini-3.5-flash-lite"
+    api_key: Optional[str] = None
 
 
 # ─── API Endpoints ────────────────────────────────────────────────
@@ -270,7 +296,7 @@ class SatvisionCompareRequest(BaseModel):
 async def health_check():
     return {
         "status": "healthy",
-        "service": "DisasterLens API",
+        "service": "TerraLab API",
         "version": "2.0.0",
         "gemini_configured": bool(config.GEMINI_API_KEY),
         "supported_disasters": [d["type"] for d in get_available_disasters()],
@@ -413,15 +439,6 @@ async def get_preset_scenarios():
                 "bbox": {"south": 35.65, "west": 139.67, "north": 35.71, "east": 139.73},
                 "parameters": {"rainfall_mm": 220.0, "duration_hours": 8.0, "sea_level_surge_m": 0.0},
                 "description": "Intense localized cloudburst exceeding underground storm canal discharge capacities.",
-            },
-            {
-                "id": "miami_cyclone",
-                "name": "Miami Atlantic Category 4 Hurricane Landfall",
-                "disaster_type": "cyclone",
-                "location_name": "Biscayne Bay, Miami, Florida, USA",
-                "bbox": {"south": 25.72, "west": -80.25, "north": 25.80, "east": -80.14},
-                "parameters": {"central_pressure_hpa": 935.0, "max_wind_kmh": 195.0, "duration_hours": 24.0},
-                "description": "Direct hurricane landfall with intense storm surge inundation across low-lying barrier islands.",
             },
             {
                 "id": "western_ghats_landslide",
@@ -880,9 +897,13 @@ def compare_simulations_endpoint(request: CompareRequest):
 
 @app.post("/api/satvision/detect")
 def satvision_detect_endpoint(request: SatvisionDetectRequest):
-    """Detect objects (OSM-vector proxy) and auto-save a detection snapshot."""
+    """Detect objects (Hybrid Optical AI or OSM-vector proxy) and auto-save a detection snapshot."""
     try:
-        result = detect_objects(request.bbox.model_dump(), request.object_types)
+        result = detect_objects(
+            request.bbox.model_dump(),
+            request.object_types,
+            model=request.model or "osm-vector",
+        )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
@@ -896,7 +917,7 @@ def satvision_detect_endpoint(request: SatvisionDetectRequest):
     return {
         "snapshot_id": snapshot_id,
         "timestamp": result.get("timestamp"),
-        "detections": (result.get("detections") or [])[:500],
+        "detections": (result.get("detections") or [])[:1000],
         "stats": result.get("stats", {}),
         "is_synthetic": result.get("is_synthetic", False),
         "not_available_types": result.get("not_available_types", []),
@@ -938,8 +959,201 @@ def satvision_compare_endpoint(request: SatvisionCompareRequest):
     }
 
 
+# ─── Geospatial Research & Field Intelligence Endpoints ───────────
+
+@app.post("/api/research/analyze")
+def research_analyze_endpoint(request: ResearchAnalyzeRequest):
+    """Analyze drawn field location using Gemini and return structured agronomy & soil telemetry."""
+    import json
+    from ai.gemini import _get_client
+    try:
+        from google import genai
+    except ImportError:
+        genai = None
+
+    raw_model = (request.model or "").strip()
+    if not raw_model or "2.0" in raw_model or "1.5" in raw_model:
+        target_model = "gemini-3.5-flash-lite"
+    else:
+        target_model = raw_model
+    api_key = request.api_key.strip() if request.api_key and request.api_key.strip() else config.GEMINI_API_KEY
+
+    if not api_key:
+        raise HTTPException(
+            status_code=400,
+            detail="Gemini API Key is not configured. Please configure a key in Settings."
+        )
+
+    client = None
+    if api_key != config.GEMINI_API_KEY and genai is not None:
+        try:
+            client = genai.Client(api_key=api_key)
+        except Exception as e:
+            logger.warning(f"Could not init custom Gemini client: {e}")
+    if client is None:
+        client = _get_client()
+
+    if client is None:
+        raise HTTPException(status_code=500, detail="Could not initialize Gemini Client")
+
+    longitude = request.resolved_lon()
+    cv_telemetry = ""
+    if request.optical_cv_context:
+        cv_telemetry = f"Optical Satellite Computer Vision Data: {json.dumps(request.optical_cv_context)}\n"
+
+    prompt = f"""
+Act as an expert Agronomist, Soil Scientist, and Geographer AI.
+Target Location: "{request.location_name}" ({request.lat:.5f}, {longitude:.5f}).
+{cv_telemetry}
+
+TASK:
+1. Check if location is predominantly open WATER/OCEAN. If yes, return valid JSON: {{"error": "Target area is a water body."}}.
+2. If LAND, return valid JSON in this exact schema:
+{{
+    "location_insight": "One engaging expert sentence about agriculture, topography, and regional geography here.",
+    "demographics": {{
+        "population_type": "Rural/Urban/Agricultural community description",
+        "language": "Primary language spoken in this region"
+    }},
+    "climate": {{
+        "temperature": "Current estimated seasonal temperature in Celsius (e.g. 28)",
+        "description": "Typical climate condition (e.g. Semi-Arid, Tropical Monsoon)",
+        "humidity": "65",
+        "wind_speed": "4.2",
+        "sea_level": "Elevation in meters above sea level"
+    }},
+    "soil": {{
+        "type": "Specific Soil Classification (e.g. Alluvial Loam, Black Cotton Vertisol)",
+        "ph": "6.8",
+        "nitrogen": "Medium",
+        "phosphorus": "High",
+        "potassium": "Optimal",
+        "metals": ["Iron", "Zinc", "Magnesium", "Copper"],
+        "moisture": "24%"
+    }},
+    "water": {{
+        "quantity": "Liters/ha requirement estimate (e.g. 450,000 L/ha)",
+        "schedule": "Recommended schedule (e.g. Drip irrigation every 4-5 days)",
+        "source": "Primary source (e.g. Groundwater aquifer, canal irrigation)"
+    }},
+    "crops": [
+        {{ "name": "Best Crop Name", "match": 96, "season": "Kharif / Summer" }},
+        {{ "name": "Alternative Crop 1", "match": 88, "season": "Rabi / Winter" }},
+        {{ "name": "Alternative Crop 2", "match": 78, "season": "Annual" }}
+    ],
+    "hazard_resilience": {{
+        "flood_risk": "Low/Moderate/High based on regional elevation & waterways",
+        "drought_stress": "Low/Moderate/High based on rainfall & aridity",
+        "overall_score": 85
+    }},
+    "strategy": "A concise, high-value expert agronomic cultivation and land preservation strategy paragraph."
+}}
+Ensure the response is valid JSON only.
+"""
+
+    # Only active, supported Flash models (gemini-3.5-flash-lite and gemini-2.5-flash)
+    models_to_try = [target_model]
+    if target_model != "gemini-3.5-flash-lite":
+        models_to_try.append("gemini-3.5-flash-lite")
+    if target_model != "gemini-2.5-flash":
+        models_to_try.append("gemini-2.5-flash")
+    last_err = None
+    for m in models_to_try:
+        try:
+            res = client.models.generate_content(
+                model=m,
+                contents=prompt,
+                config={"response_mime_type": "application/json"}
+            )
+            raw = (res.text or "").strip()
+            if raw.startswith("```json"):
+                raw = raw[7:]
+            elif raw.startswith("```"):
+                raw = raw[3:]
+            if raw.endswith("```"):
+                raw = raw[:-3]
+            raw = raw.strip()
+            data = json.loads(raw)
+            data["location"] = request.location_name
+            data["lat"] = request.lat
+            data["lng"] = longitude
+            data["model_used"] = m
+            return data
+        except Exception as err:
+            logger.warning(f"[Research Analyze] Model {m} attempt failed: {err}")
+            last_err = err
+            continue
+
+    raise HTTPException(status_code=500, detail=f"AI Field Analysis failed: {str(last_err)}")
+
+
+@app.post("/api/research/chat")
+def research_chat_endpoint(request: ResearchChatRequest):
+    """Context-grounded chat for precision agriculture & research."""
+    from ai.gemini import _get_client
+    try:
+        from google import genai
+    except ImportError:
+        genai = None
+
+    raw_model = (request.model or "").strip()
+    if not raw_model or "2.0" in raw_model or "1.5" in raw_model:
+        target_model = "gemini-3.5-flash-lite"
+    else:
+        target_model = raw_model
+    api_key = request.api_key.strip() if request.api_key and request.api_key.strip() else config.GEMINI_API_KEY
+
+    if not api_key:
+        raise HTTPException(
+            status_code=400,
+            detail="Gemini API Key is not configured. Please configure a key in Settings."
+        )
+
+    client = None
+    if api_key != config.GEMINI_API_KEY and genai is not None:
+        try:
+            client = genai.Client(api_key=api_key)
+        except Exception as e:
+            logger.warning(f"Could not init custom Gemini client: {e}")
+    if client is None:
+        client = _get_client()
+
+    if client is None:
+        raise HTTPException(status_code=500, detail="Could not initialize Gemini Client")
+
+    prompt = (
+        f"You are an expert agronomist, soil scientist, and geospatial intelligence researcher. "
+        f"Question: \"{request.question}\"\n"
+        f"Context & Field Telemetry: {request.context}\n"
+        f"Provide a helpful, direct, concise answer in markdown format."
+    )
+
+    models_to_try = [target_model]
+    if target_model != "gemini-3.5-flash-lite":
+        models_to_try.append("gemini-3.5-flash-lite")
+    if target_model != "gemini-2.5-flash":
+        models_to_try.append("gemini-2.5-flash")
+    last_err = None
+    for m in models_to_try:
+        try:
+            res = client.models.generate_content(
+                model=m,
+                contents=prompt,
+            )
+            return {
+                "answer": (res.text or "").strip(),
+                "model_used": m
+            }
+        except Exception as err:
+            logger.warning(f"[Research Chat] Model {m} attempt failed: {err}")
+            last_err = err
+            continue
+
+    raise HTTPException(status_code=500, detail=f"AI Chat failed: {str(last_err)}")
+
+
 if __name__ == "__main__":
     import uvicorn
-    logger.info("\n[*] DisasterLens API Server Starting...")
+    logger.info("\n[*] TerraLab API Server Starting...")
     # DisasterLens Fast-Marching Wavefront Wildfire Engine Active
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

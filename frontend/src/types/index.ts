@@ -311,6 +311,9 @@ export interface SatStats {
   by_type: Record<string, number>;
   area_covered_sqm: number;
   mean_confidence: number;
+  vegetation_pct?: number;
+  water_pct?: number;
+  built_up_pct?: number;
 }
 
 export interface SatDetectResponse {

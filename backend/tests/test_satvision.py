@@ -211,3 +211,33 @@ def test_snapshots_list_endpoint(monkeypatch):
     assert listed.status_code == 200
     ids = [s["id"] for s in listed.json()["snapshots"]]
     assert sid in ids
+
+
+def test_detect_hybrid_optical_satellite(monkeypatch):
+    import satvision
+    import numpy as np
+
+    monkeypatch.setattr(satvision, "fetch_geodata", lambda *a, **k: _canned_one_building_one_road())
+    # Mock synthetic optical satellite image with green vegetation and blue water
+    fake_img = np.zeros((100, 100, 3), dtype=np.uint8)
+    fake_img[10:30, 10:30] = [20, 180, 20]  # green vegetation
+    fake_img[40:60, 40:60] = [20, 70, 150]  # water body
+    monkeypatch.setattr(satvision, "_fetch_arcgis_satellite_raster", lambda bbox: fake_img)
+
+    res = client.post(
+        "/api/satvision/detect",
+        json={
+            "bbox": BBOX,
+            "object_types": ["building", "road", "water", "tree", "solar"],
+            "model": "hybrid",
+        },
+    )
+    assert res.status_code == 200
+    data = res.json()
+    _track(data["snapshot_id"])
+    assert data["not_available_types"] == []
+    assert data["stats"]["total"] >= 2  # building + road + optical detections
+    types = [d["type"] for d in data["detections"]]
+    assert "building" in types
+    assert "road" in types
+    assert "tree" in types or "water" in types

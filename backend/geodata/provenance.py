@@ -1,8 +1,8 @@
 """
-DisasterLens — Data Provenance & Evidence Engine
+TerraLab — Data Provenance & Evidence Engine
 =================================================
 Maintains explicit records for every dataset, remote sensing product,
-and hazard model used in DisasterLens.
+and hazard model used in TerraLab.
 """
 
 from typing import List, Dict, Any
@@ -150,7 +150,7 @@ MODEL_PROVENANCE: Dict[str, Dict[str, Any]] = {
 }
 
 DISCLAIMER_NOTICE = (
-    "DisasterLens provides scientific model-based hazard simulation and impact estimation "
+    "TerraLab provides scientific model-based hazard simulation and impact estimation "
     "for emergency planning, research, and decision-support. It is not an official government "
     "emergency warning, evacuation order, or guaranteed physical prediction. Real emergency "
     "operations should coordinate with local disaster management authorities (e.g. NDMA/FEMA)."
@@ -172,3 +172,4 @@ def get_provenance_summary(disaster_type: str = "flood") -> Dict[str, Any]:
         "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "disclaimer": DISCLAIMER_NOTICE,
     }
+

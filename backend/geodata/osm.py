@@ -39,6 +39,7 @@ out geom;
 _BUILDINGS_QUERY = """
 [out:json][timeout:60];
 (
+  node["building"]({bbox});
   way["building"]({bbox});
   relation["building"]({bbox});
 );

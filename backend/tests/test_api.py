@@ -29,7 +29,7 @@ def test_list_disasters():
     assert "earthquake" in types
     assert "wildfire" in types
     assert "landslide" in types
-    assert "cyclone" in types
+    assert "cyclone" not in types  # temporarily unsupported via API
 
 
 def test_presets():

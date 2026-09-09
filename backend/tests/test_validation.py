@@ -10,7 +10,7 @@ Required validators in main.py:
 - BoundingBox: south < north, west < east, lat in [-90, 90], lon in [-180, 180],
   and total area below an oversized cap.
 - SimulationRequest.disaster_type: one of flood, earthquake, wildfire,
-  landslide, cyclone (anything else -> 422).
+  landslide (cyclone temporarily unsupported; anything else -> 422).
 """
 
 import os

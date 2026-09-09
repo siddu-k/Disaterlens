@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useMemo, useCallback } from 'react';
+import { useState, useRef, useEffect, useMemo, useCallback, lazy, Suspense } from 'react';
 import './index.css';
 import {
   SimulationResult,
@@ -23,10 +23,9 @@ import {
   saveAiKey,
 } from './services/api';
 import MapView from './components/MapView';
-import LandingPage from './components/LandingPage';
 import ErrorBoundary from './components/ErrorBoundary';
-import ResearchCard from './components/ResearchCard';
 import SatVisionPage from './components/SatVisionPage';
+import ResearchPage from './components/ResearchPage';
 import {
   IconLocationPin,
   IconSearch,
@@ -135,8 +134,10 @@ function getCompassLabel(deg: number): string {
   return match ? `${match.label} (${Math.round(d)}°)` : `${Math.round(d)}°`;
 }
 
-function App() {
-  // State (Initialized clean: no auto-selected city or auto-scan on start)
+// Landing page is code-split: never part of the main app bundle.
+const LandingPage = lazy(() => import('./components/LandingPage'));
+
+function App() {  // State (Initialized clean: no auto-selected city or auto-scan on start)
   const [disasterType, setDisasterType] = useState<DisasterType>('flood');
   const [locationName, setLocationName] = useState('');
   const [bbox, setBbox] = useState<BoundingBox | null>(null);
@@ -264,7 +265,7 @@ function App() {
   const [satCompareMix, setSatCompareMix] = useState<number>(0.5);
   const [focusedPoint, setFocusedPoint] = useState<{ lat: number; lon: number; nonce: number } | null>(null);
   const [satVisionPageOpen, setSatVisionPageOpen] = useState(false);
-  const [researchOpen, setResearchOpen] = useState(false);
+  const [researchPageOpen, setResearchPageOpen] = useState(false);
 
   // Drawers & Modals
   const [showScenarioModal, setShowScenarioModal] = useState(false);
@@ -541,8 +542,6 @@ function App() {
             ? `${overrides?.rainfall_mm ?? rainfallMm}mm Rain, +${overrides?.sea_level_surge_m ?? seaLevelSurge}m Surge (${overrides?.duration_hours ?? durationHours}h)`
             : targetDisaster === 'earthquake'
             ? `Mw ${overrides?.magnitude ?? magnitude} (${overrides?.depth_km ?? depthKm}km Depth)`
-            : targetDisaster === 'cyclone'
-            ? `${overrides?.wind_speed_kmh ?? windSpeedKmh} km/h, ${getCompassLabel(overrides?.cyclone_direction_deg ?? cycloneDirection)}, R=${overrides?.cyclone_radius_km ?? cycloneRadiusKm}km`
             : targetDisaster === 'wildfire'
             ? `${overrides?.temperature_c ?? wildfireTempC}°C, ${overrides?.wind_speed_kmh ?? wildfireWindSpeed}km/h Wind, ${fuelType === 'auto' ? 'Auto DEM Fuel' : fuelType}`
             : `${overrides?.rainfall_mm ?? rainfallMm}mm Rain`,
@@ -569,7 +568,7 @@ function App() {
   };
 
   const disasterIcon = (d: string, size = 14) =>
-    d === 'flood' ? <IconFlood size={size} /> : d === 'cyclone' ? <IconCyclone size={size} /> : d === 'earthquake' ? <IconEarthquake size={size} /> : d === 'wildfire' ? <IconHeatwave size={size} /> : <IconLandslide size={size} />;
+    d === 'flood' ? <IconFlood size={size} /> : d === 'earthquake' ? <IconEarthquake size={size} /> : d === 'wildfire' ? <IconHeatwave size={size} /> : <IconLandslide size={size} />;
 
   // Restore a previous run from history (map, timeline, impact + provenance all follow `result`)
   const handleSelectHistoryRun = (entry: { disaster: string; result: SimulationResult }) => {
@@ -898,14 +897,23 @@ function App() {
 
   if (!entered) {
     return (
-      <LandingPage
-        onLaunch={() => {
-          try {
-            sessionStorage.setItem('disasterlens-entered', '1');
-          } catch {}
-          setEntered(true);
-        }}
-      />
+      <Suspense
+        fallback={
+          <div className="lp-boot">
+            <div className="lp-boot-mark" />
+              <span>Loading TerraLab…</span>
+          </div>
+        }
+      >
+        <LandingPage
+          onLaunch={() => {
+            try {
+              sessionStorage.setItem('disasterlens-entered', '1');
+            } catch {}
+            setEntered(true);
+          }}
+        />
+      </Suspense>
     );
   }
 
@@ -950,8 +958,8 @@ function App() {
               </svg>
             </div>
             <div>
-              <div className="sidebar-brand-title">DisasterLens</div>
-              <div className="sidebar-brand-sub">Real Data. Real Impact.</div>
+              <div className="sidebar-brand-title">TerraLab</div>
+              <div className="sidebar-brand-sub">Real-World Impact Simulation & Research Platform</div>
             </div>
           </div>
 
@@ -986,10 +994,7 @@ function App() {
             </button>
             <button
               className="sidebar-nav-btn"
-              onClick={() => {
-                setResearchOpen(true);
-                setTimeout(() => document.getElementById('research-card')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 60);
-              }}
+              onClick={() => setResearchPageOpen(true)}
             >
               <span className="sidebar-nav-icon">
                 <IconLightbulb size={18} />
@@ -1309,11 +1314,9 @@ function App() {
                   <div className="scenario-title-row">
                 <span>{disasterIcon(disasterType, 16)}</span>
                 <span>
-                  {disasterType === 'flood'
-                    ? `${durationHours}-hour Extreme Rainfall`
-                    : disasterType === 'cyclone'
-                    ? `${durationHours}-hour Cyclone Landfall`
-                    : disasterType === 'earthquake'
+                    {disasterType === 'flood'
+                      ? `${durationHours}-hour Extreme Rainfall`
+                      : disasterType === 'earthquake'
                     ? `Mw ${magnitude} Severe Earthquake (90s Rupture)`
                     : disasterType === 'wildfire'
                     ? `${durationHours < 1 ? `${Math.round(durationHours * 60)}-minute` : durationHours % 1 !== 0 ? `${Math.floor(durationHours)}h ${Math.round((durationHours % 1) * 60)}m` : `${durationHours}-hour`} Wildfire Spread`
@@ -1366,217 +1369,6 @@ function App() {
                         step={0.5}
                         value={seaLevelSurge}
                         onChange={(e) => setSeaLevelSurge(Number(e.target.value))}
-                      />
-                    </div>
-                  </>
-                )}
-                {disasterType === 'cyclone' && (
-                  <>
-                    {/* Live Cyclone Intensity & Surge Prediction Banner */}
-                    <div
-                      style={{
-                        padding: '10px 12px',
-                        marginBottom: '12px',
-                        borderRadius: '8px',
-                        background: 'rgba(15, 23, 42, 0.75)',
-                        border: `1px solid ${cycloneCategoryInfo.border}`,
-                        boxShadow: `0 0 14px ${cycloneCategoryInfo.border}22`,
-                      }}
-                    >
-                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '6px' }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                          <IconCyclone size={15} color={cycloneCategoryInfo.color} />
-                          <span style={{ fontWeight: 700, fontSize: '12.5px', color: cycloneCategoryInfo.color }}>
-                            {cycloneCategoryInfo.cat}
-                          </span>
-                        </div>
-                        <span
-                          style={{
-                            fontSize: '10px',
-                            fontWeight: 600,
-                            padding: '2px 6px',
-                            borderRadius: '4px',
-                            background: `${cycloneCategoryInfo.color}22`,
-                            color: cycloneCategoryInfo.color,
-                            border: `1px solid ${cycloneCategoryInfo.color}44`,
-                            textTransform: 'uppercase',
-                          }}
-                        >
-                          {cycloneCategoryInfo.badge}
-                        </span>
-                      </div>
-                      <div style={{ fontSize: '10.5px', color: '#94a3b8', marginBottom: '8px' }}>
-                        {cycloneCategoryInfo.imd}
-                      </div>
-                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px', paddingTop: '6px', borderTop: '1px solid rgba(255,255,255,0.08)' }}>
-                        <div>
-                          <div style={{ fontSize: '9.5px', color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.4px' }}>Est. Coastal Surge</div>
-                          <div style={{ fontSize: '12.5px', fontWeight: 700, color: '#38bdf8' }}>+{cycloneEstimatedSurgeM.toFixed(2)} m</div>
-                        </div>
-                        <div>
-                          <div style={{ fontSize: '9.5px', color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.4px' }}>Core Pressure Deficit</div>
-                          <div style={{ fontSize: '12.5px', fontWeight: 700, color: '#f59e0b' }}>ΔP {Math.max(0, 1013 - centralPressure)} hPa</div>
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="scenario-slider-row">
-                      <div className="scenario-slider-meta">
-                        <span>Movement Direction (Heading)</span>
-                        <span className="scenario-slider-val">{getCompassLabel(cycloneDirection)}</span>
-                      </div>
-                      <input
-                        type="range"
-                        className="scenario-range-input"
-                        min={0}
-                        max={360}
-                        step={5}
-                        value={cycloneDirection}
-                        onChange={(e) => setCycloneDirection(Number(e.target.value))}
-                      />
-                      <div className="scenario-pill-presets" style={{ display: 'flex', gap: '4px', marginTop: '6px', flexWrap: 'wrap' }}>
-                        {[
-                          { label: 'NW 315°', val: 315 },
-                          { label: 'N 0°', val: 0 },
-                          { label: 'NE 45°', val: 45 },
-                          { label: 'W 270°', val: 270 },
-                          { label: 'SW 225°', val: 225 },
-                          { label: 'E 90°', val: 90 },
-                        ].map((p) => (
-                          <button
-                            key={p.label}
-                            type="button"
-                            className={`scenario-preset-pill ${cycloneDirection === p.val ? 'scenario-preset-pill--active' : ''}`}
-                            onClick={() => setCycloneDirection(p.val)}
-                            style={{
-                              fontSize: '10.5px',
-                              padding: '2px 7px',
-                              borderRadius: '4px',
-                              background: cycloneDirection === p.val ? 'rgba(56, 189, 248, 0.25)' : 'rgba(30, 41, 59, 0.7)',
-                              border: cycloneDirection === p.val ? '1px solid #38bdf8' : '1px solid rgba(255,255,255,0.1)',
-                              color: cycloneDirection === p.val ? '#38bdf8' : '#94a3b8',
-                              cursor: 'pointer',
-                            }}
-                          >
-                            {p.label}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-
-                    <div className="scenario-slider-row">
-                      <div className="scenario-slider-meta">
-                        <span>Max Sustained Wind Speed</span>
-                        <span className="scenario-slider-val" style={{ color: cycloneCategoryInfo.color, fontWeight: 700 }}>
-                          {windSpeedKmh} km/h
-                        </span>
-                      </div>
-                      <input
-                        type="range"
-                        className="scenario-range-input"
-                        min={60}
-                        max={300}
-                        step={5}
-                        value={windSpeedKmh}
-                        onChange={(e) => setWindSpeedKmh(Number(e.target.value))}
-                      />
-                    </div>
-
-                    <div className="scenario-slider-row">
-                      <div className="scenario-slider-meta" style={{ alignItems: 'center' }}>
-                        <span>Central Pressure (Pc)</span>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                          <button
-                            type="button"
-                            title="Auto-calculate physically consistent pressure from wind speed"
-                            onClick={() => autoSyncPressureFromWind(windSpeedKmh)}
-                            style={{
-                              fontSize: '9.5px',
-                              padding: '1px 5px',
-                              borderRadius: '3px',
-                              background: 'rgba(56, 189, 248, 0.15)',
-                              border: '1px solid rgba(56, 189, 248, 0.4)',
-                              color: '#38bdf8',
-                              cursor: 'pointer',
-                            }}
-                          >
-                            <IconBolt size={10} style={{ marginRight: 3 }} /> Auto-Sync
-                          </button>
-                          <span className="scenario-slider-val">{centralPressure} hPa</span>
-                        </div>
-                      </div>
-                      <input
-                        type="range"
-                        className="scenario-range-input"
-                        min={880}
-                        max={1005}
-                        step={5}
-                        value={centralPressure}
-                        onChange={(e) => setCentralPressure(Number(e.target.value))}
-                      />
-                    </div>
-
-                    <div className="scenario-slider-row">
-                      <div className="scenario-slider-meta">
-                        <span>Cyclone Eye Wall Radius (Rmax)</span>
-                        <span className="scenario-slider-val">{cycloneRadiusKm} km</span>
-                      </div>
-                      <input
-                        type="range"
-                        className="scenario-range-input"
-                        min={15}
-                        max={90}
-                        step={1}
-                        value={cycloneRadiusKm}
-                        onChange={(e) => setCycloneRadiusKm(Number(e.target.value))}
-                      />
-                    </div>
-
-                    <div className="scenario-slider-row">
-                      <div className="scenario-slider-meta">
-                        <span>Outer Storm Gale Radius</span>
-                        <span className="scenario-slider-val">{stormRadiusKm} km</span>
-                      </div>
-                      <input
-                        type="range"
-                        className="scenario-range-input"
-                        min={60}
-                        max={400}
-                        step={10}
-                        value={stormRadiusKm}
-                        onChange={(e) => setStormRadiusKm(Number(e.target.value))}
-                      />
-                    </div>
-
-                    <div className="scenario-slider-row">
-                      <div className="scenario-slider-meta">
-                        <span>Forward Translation Speed</span>
-                        <span className="scenario-slider-val">{cycloneSpeedKmh} km/h</span>
-                      </div>
-                      <input
-                        type="range"
-                        className="scenario-range-input"
-                        min={8}
-                        max={65}
-                        step={1}
-                        value={cycloneSpeedKmh}
-                        onChange={(e) => setCycloneSpeedKmh(Number(e.target.value))}
-                      />
-                    </div>
-
-                    <div className="scenario-slider-row">
-                      <div className="scenario-slider-meta">
-                        <span>Duration</span>
-                        <span className="scenario-slider-val">{durationHours} hours</span>
-                      </div>
-                      <input
-                        type="range"
-                        className="scenario-range-input"
-                        min={1}
-                        max={72}
-                        step={1}
-                        value={durationHours}
-                        onChange={(e) => setDurationHours(Number(e.target.value))}
                       />
                     </div>
                   </>
@@ -2336,7 +2128,7 @@ function App() {
                       {result && impact ? `${(impact.flooded_area_km2 ?? impact.affected_area_km2 ?? 0).toFixed(2)} km²` : '—'}
                     </div>
                     <div className="impact-2x2-label">
-                      {disasterType === 'flood' ? 'Estimated Flooded Area' : disasterType === 'wildfire' ? 'Estimated Burn Area' : disasterType === 'earthquake' ? 'Shaking Area (MMI VI+)' : disasterType === 'landslide' ? 'Unstable Slope Area' : disasterType === 'cyclone' ? 'Storm Impact Area' : 'Estimated Impact Area'}
+                      {disasterType === 'flood' ? 'Estimated Flooded Area' : disasterType === 'wildfire' ? 'Estimated Burn Area' : disasterType === 'earthquake' ? 'Shaking Area (MMI VI+)' : disasterType === 'landslide' ? 'Unstable Slope Area' : 'Estimated Impact Area'}
                     </div>
                   </div>
                 </div>
@@ -2352,7 +2144,7 @@ function App() {
                     <div className="impact-2x2-label">Population Exposed</div>
                     {result && impact && disasterType === 'earthquake' && (impact.estimated_fatalities || impact.estimated_injuries) ? (
                       <div className="impact-2x2-sub">≈ {impact.estimated_fatalities ?? 0} deaths • {(impact.estimated_injuries ?? 0).toLocaleString()} injured</div>
-                    ) : result && impact && (disasterType === 'flood' || disasterType === 'cyclone') && (impact.estimated_displaced ?? 0) > 0 ? (
+                    ) : result && impact && disasterType === 'flood' && (impact.estimated_displaced ?? 0) > 0 ? (
                       <div className="impact-2x2-sub">≈ {(impact.estimated_displaced ?? 0).toLocaleString()} displaced</div>
                     ) : result && impact && disasterType === 'wildfire' && (impact.population_smoke_exposed ?? 0) > 0 ? (
                       <div className="impact-2x2-sub">≈ {(impact.population_smoke_exposed ?? 0).toLocaleString()} smoke-exposed</div>
@@ -2499,9 +2291,6 @@ function App() {
                 )}
               </div>
             </div>
-
-            {/* Card 6: Research (placeholder) */}
-            <ResearchCard open={researchOpen} setOpen={setResearchOpen} />
           </aside>
           </ErrorBoundary>
         </main>
@@ -2583,18 +2372,6 @@ function App() {
                 </div>
               </div>
             )}
-            {disasterType === 'cyclone' && (
-              <div className="param-controls-grid">
-                <div className="param-field">
-                  <label htmlFor="param-wind">Max Wind Speed: {windSpeedKmh} km/h</label>
-                  <input id="param-wind" type="range" min="60" max="280" step="5" value={windSpeedKmh} onChange={(e) => setWindSpeedKmh(Number(e.target.value))} />
-                </div>
-                <div className="param-field">
-                  <label htmlFor="param-pressure">Central Pressure: {centralPressure} hPa</label>
-                  <input id="param-pressure" type="range" min="890" max="1000" step="5" value={centralPressure} onChange={(e) => setCentralPressure(Number(e.target.value))} />
-                </div>
-              </div>
-            )}
 
             <div className="modal-actions">
               <button className="btn-cancel" onClick={() => setShowScenarioModal(false)}>Close</button>
@@ -2622,6 +2399,18 @@ function App() {
           focusedPoint={focusedPoint}
           setFocusedPoint={setFocusedPoint}
           onBack={() => setSatVisionPageOpen(false)}
+        />
+      )}
+
+      {/* ─── Research Workstation (aiarea.html precision field research) ─── */}
+      {researchPageOpen && (
+        <ResearchPage
+          onBack={() => setResearchPageOpen(false)}
+          onSendToSimulation={(locName, farmBbox) => {
+            if (locName) setLocationName(locName);
+            if (farmBbox) setBbox(farmBbox);
+            setResearchPageOpen(false);
+          }}
         />
       )}
 

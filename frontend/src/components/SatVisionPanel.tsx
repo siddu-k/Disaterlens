@@ -51,7 +51,8 @@ export default function SatVisionPanel({
   };
   const [detectOpen, setDetectOpen] = useState(false);
   const [diffOpen, setDiffOpen] = useState(false);
-  const [objectTypes, setObjectTypes] = useState<string[]>(['building', 'road']);
+  const [modelMode, setModelMode] = useState<'hybrid' | 'osm-vector'>('hybrid');
+  const [objectTypes, setObjectTypes] = useState<string[]>(['building', 'road', 'water', 'tree', 'solar']);
   const [detectLoading, setDetectLoading] = useState(false);
   const [detectError, setDetectError] = useState<string | null>(null);
   const [stats, setStats] = useState<SatStats | null>(null);
@@ -84,7 +85,7 @@ export default function SatVisionPanel({
     setDetectLoading(true);
     setDetectError(null);
     try {
-      const res = await detectObjects(bbox, objectTypes);
+      const res = await detectObjects(bbox, objectTypes, modelMode);
       setSatDetections(res.detections || []);
       setStats(res.stats || null);
       if (onResultCount) onResultCount(res.detections?.length ?? 0);
@@ -178,6 +179,45 @@ export default function SatVisionPanel({
             </button>
             {detectOpen && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                <div style={{ display: 'flex', gap: 4, background: '#0a0f1d', padding: 2, borderRadius: 6, border: '1px solid #1e293b' }}>
+                  <button
+                    type="button"
+                    onClick={() => setModelMode('hybrid')}
+                    style={{
+                      flex: 1,
+                      padding: '4px 6px',
+                      fontSize: 10.5,
+                      fontWeight: modelMode === 'hybrid' ? 600 : 400,
+                      background: modelMode === 'hybrid' ? '#1e293b' : 'transparent',
+                      color: modelMode === 'hybrid' ? '#38bdf8' : '#94a3b8',
+                      border: 'none',
+                      borderRadius: 4,
+                      cursor: 'pointer',
+                    }}
+                    title="Real-time optical satellite AI (ArcGIS) fused with OSM. Detects water, trees, solar, and unmapped buildings."
+                  >
+                    ✦ Optical AI Vision (Hybrid)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setModelMode('osm-vector')}
+                    style={{
+                      flex: 1,
+                      padding: '4px 6px',
+                      fontSize: 10.5,
+                      fontWeight: modelMode === 'osm-vector' ? 600 : 400,
+                      background: modelMode === 'osm-vector' ? '#1e293b' : 'transparent',
+                      color: modelMode === 'osm-vector' ? '#38bdf8' : '#94a3b8',
+                      border: 'none',
+                      borderRadius: 4,
+                      cursor: 'pointer',
+                    }}
+                    title="Pure OpenStreetMap vector data baseline"
+                  >
+                    OSM Vector Only
+                  </button>
+                </div>
+
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
                   {SAT_OBJECT_OPTIONS.map((opt) => (
                     <label key={opt.value} style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11.5, color: '#cbd5e1', cursor: 'pointer' }}>
@@ -221,17 +261,24 @@ export default function SatVisionPanel({
                 )}
                 {satDetections && satDetections.length > 0 && (
                   <div className="facilities-list satvision-scroll-list">
-                    {satDetections.slice(0, 50).map((d, idx) => (
+                    {satDetections.slice(0, 100).map((d, idx) => (
                       <button
                         key={String(d.id) || idx}
                         className="facility-list-row satvision-row"
                         onClick={() => onLocateDetection(d.lat, d.lon)}
                         aria-label={`Locate ${d.type} detection at ${d.lat.toFixed(4)}, ${d.lon.toFixed(4)}`}
-                        title={`${d.type} • conf ${(d.confidence * 100).toFixed(0)}% — click to locate`}
+                        title={`${d.type} • conf ${(d.confidence * 100).toFixed(0)}% • ${d.source || 'OpenStreetMap'} — click to locate`}
                       >
-                        <span className="facility-list-left">
-                          <IconLocationPin size={13} />
-                          <span className="facility-list-name">{String(d.type)} • {(d.confidence * 100).toFixed(0)}%</span>
+                        <span className="facility-list-left" style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 2 }}>
+                          <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                            <IconLocationPin size={13} />
+                            <span className="facility-list-name">{String(d.type)} • {(d.confidence * 100).toFixed(0)}%</span>
+                          </span>
+                          {d.source && (
+                            <span style={{ fontSize: 9.5, color: d.source.includes('Optical') ? '#38bdf8' : '#94a3b8', paddingLeft: 17 }}>
+                              {d.source.includes('Unmapped') ? '✦ Satellite Unmapped' : d.source.includes('Optical') ? '✦ Satellite AI' : 'OSM Vector'}
+                            </span>
+                          )}
                         </span>
                         <span className="facility-list-right">
                           {d.area_sqm != null ? `${Math.round(d.area_sqm)} m²` : `${d.lat.toFixed(3)}, ${d.lon.toFixed(3)}`}

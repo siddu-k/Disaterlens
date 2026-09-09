@@ -1,5 +1,5 @@
 """
-DisasterLens — AI Assistant & Scenario Engine (Google Gemini)
+TerraLab — AI Assistant & Scenario Engine (Google Gemini)
 =============================================================
 Provides two distinct AI capabilities:
 1. Strict Natural Language Scenario Parser: converts user prompts into validated
@@ -21,7 +21,7 @@ try:
 except ImportError:
     genai = None
 
-ALLOWED_DISASTER_TYPES = {"flood", "cyclone", "earthquake", "wildfire", "landslide"}
+ALLOWED_DISASTER_TYPES = {"flood", "earthquake", "wildfire", "landslide"}
 
 _client = None
 
@@ -55,7 +55,7 @@ def _validate_disaster_type(value: Any) -> str:
 
 
 class ParsedScenario(BaseModel):
-    disaster_type: str = Field(description="One of: flood, earthquake, wildfire, landslide, cyclone")
+    disaster_type: str = Field(description="One of: flood, earthquake, wildfire, landslide")
     parameters: Dict[str, float] = Field(description="Key-value mapping of numerical scenario parameters")
     confidence: float = Field(description="Confidence score 0.0 - 1.0")
     explanation: Optional[str] = Field(default=None, description="Concise 1-2 sentence explanation of the parameters assigned and physical context")
@@ -102,14 +102,13 @@ def parse_natural_language_scenario(
             interaction = client.interactions.create(
                 model=target_model,
                 input=(
-                    "You are a strict disaster scenario parameter extractor for DisasterLens. "
+                    "You are a strict disaster scenario parameter extractor for TerraLab. "
                     "Extract numerical scenario parameters from the prompt and return valid JSON ONLY.\n"
                     "JSON schema:\n"
                     "{\n"
-                    '  "disaster_type": "flood" | "cyclone" | "earthquake" | "wildfire" | "landslide",\n'
+                    '  "disaster_type": "flood" | "earthquake" | "wildfire" | "landslide",\n'
                     '  "parameters": {\n'
                     '    // for flood: "rainfall_mm", "duration_hours", "sea_level_surge_m"\n'
-                    '    // for cyclone: "max_wind_kmh", "central_pressure_hpa", "cyclone_direction_deg", "cyclone_radius_km", "storm_radius_km", "forward_speed_kmh", "duration_hours"\n'
                     '    // for earthquake: "magnitude", "depth_km"\n'
                     '    // for wildfire: "wind_speed_kmh", "wind_direction_deg", "temperature_c", "relative_humidity_pct"\n'
                     '    // for landslide: "cumulative_rainfall_mm", "duration_hours"\n'
@@ -155,10 +154,10 @@ def parse_natural_language_scenario(
 
     # 2. Secondary path: client.models.generate_content with model="gemini-3.5-flash-lite" (with fallback to 2.0)
     system_instructions = (
-        "You are a strict disaster scenario parameter extractor for DisasterLens. Extract numerical scenario parameters "
+        "You are a strict disaster scenario parameter extractor for TerraLab. Extract numerical scenario parameters "
         "into JSON for physical simulation models. Valid disaster types: flood (rainfall_mm, duration_hours, sea_level_surge_m), "
         "earthquake (magnitude, depth_km), wildfire (wind_speed_kmh, wind_direction_deg, temperature_c, relative_humidity_pct), "
-        "landslide (cumulative_rainfall_mm, duration_hours), cyclone (central_pressure_hpa, max_wind_kmh, cyclone_direction_deg, cyclone_radius_km, storm_radius_km, forward_speed_kmh, duration_hours). "
+        "landslide (cumulative_rainfall_mm, duration_hours). "
         "Provide a concise explanation explaining what values you extracted and why."
     )
 
@@ -239,7 +238,7 @@ def _build_strict_context(scenario: Dict[str, Any], impact: Dict[str, Any], loca
     road_status = impact.get("road_status", {})
     routes = impact.get("evacuation_routes", [])
 
-    return f"""You are DisasterLens AI Analyst. Explain ONLY the computed metrics provided below.
+    return f"""You are TerraLab AI Analyst. Explain ONLY the computed metrics provided below.
 DO NOT fabricate any road names, population numbers, or depths that are not in the data.
 Explicitly distinguish:
 - Modeled: Flooded area, peak depth/intensity, road accessibility state
@@ -269,7 +268,7 @@ def _fallback_parse_scenario(prompt: str, current_disaster: str) -> Dict[str, An
 
     # Detect disaster type
     dtype = current_disaster
-    for d in ["earthquake", "wildfire", "landslide", "cyclone", "flood"]:
+    for d in ["earthquake", "wildfire", "landslide", "flood"]:
         if d in p_lower:
             dtype = d
             break
@@ -392,3 +391,4 @@ def _fallback_insight(scenario: Dict[str, Any], impact: Dict[str, Any], location
         ],
         "source": "Deterministic GIS & Scientific Rule Engine",
     }
+

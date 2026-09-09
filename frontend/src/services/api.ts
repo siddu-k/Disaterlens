@@ -207,13 +207,17 @@ export interface SatDetectResult {
   not_available_types: string[];
 }
 
-export async function detectObjects(bbox: BoundingBox, object_types: string[]): Promise<SatDetectResult> {
+export async function detectObjects(
+  bbox: BoundingBox,
+  object_types: string[],
+  model: string = 'hybrid'
+): Promise<SatDetectResult> {
   return fetchJson<SatDetectResult>(
     `${API_BASE}/satvision/detect`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ bbox, object_types }),
+      body: JSON.stringify({ bbox, object_types, model }),
     }
   );
 }
@@ -235,4 +239,89 @@ export async function compareSnapshots(snapshot_id_a: string, snapshot_id_b: str
       body: JSON.stringify({ snapshot_id_a, snapshot_id_b }),
     }
   );
+}
+
+// ─── Geospatial Research & Precision Field Intelligence ────────────
+
+export interface ResearchFieldData {
+  location_insight: string;
+  demographics?: {
+    population_type: string;
+    language: string;
+  };
+  climate?: {
+    temperature: string;
+    description: string;
+    humidity: string;
+    wind_speed: string;
+    sea_level?: string;
+  };
+  soil: {
+    type: string;
+    ph: string;
+    nitrogen?: string;
+    phosphorus?: string;
+    potassium?: string;
+    metals?: string[];
+    moisture?: string;
+  };
+  water: {
+    quantity: string;
+    schedule: string;
+    source?: string;
+  };
+  crops: Array<{
+    name: string;
+    match: number;
+    season: string;
+  }>;
+  hazard_resilience?: {
+    flood_risk?: string;
+    drought_stress?: string;
+    overall_score?: number;
+  };
+  strategy: string;
+  error?: string;
+  location?: string;
+  lat?: number;
+  lng?: number;
+  model_used?: string;
+}
+
+export interface ResearchChatResult {
+  answer: string;
+  model_used?: string;
+}
+
+export async function analyzeResearchField(params: {
+  lat: number;
+  lon: number;
+  location_name?: string;
+  model?: string;
+  api_key?: string;
+  bbox?: number[];
+  optical_cv_context?: {
+    vegetation_pct?: number;
+    water_pct?: number;
+    structures_count?: number;
+  };
+}): Promise<ResearchFieldData> {
+  return fetchJson<ResearchFieldData>(`${API_BASE}/research/analyze`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  });
+}
+
+export async function chatResearchField(params: {
+  question: string;
+  context?: string;
+  model?: string;
+  api_key?: string;
+}): Promise<ResearchChatResult> {
+  return fetchJson<ResearchChatResult>(`${API_BASE}/research/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  });
 }

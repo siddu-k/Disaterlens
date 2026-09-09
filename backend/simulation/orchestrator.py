@@ -26,11 +26,16 @@ MODULE_REGISTRY: Dict[str, BaseHazardModule] = {
     key: cls() for key, cls in MODULE_CLASSES.items()
 }
 
+# Temporarily unsupported via API (engine retained for direct use/tests).
+UNSUPPORTED_DISASTER_TYPES = {"cyclone"}
+
 
 def get_available_disasters() -> List[Dict[str, Any]]:
     """List all registered disaster modules with their scientific specifications."""
     disasters = []
     for key, cls in MODULE_CLASSES.items():
+        if key in UNSUPPORTED_DISASTER_TYPES:
+            continue
         mod = cls()
         meta = mod.get_metadata(resolution_m=90.0, timestep_hours=4.0)
         disasters.append({

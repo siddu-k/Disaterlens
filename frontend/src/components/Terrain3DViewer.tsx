@@ -596,7 +596,7 @@ export default function Terrain3DViewer({
   // ─── 3D Selected Tile & Floating Satellite Hover State ───
   const [selectedTile, setSelectedTile] = useState<{ r: number; c: number } | null>(null);
   const [hoveredTile, setHoveredTile] = useState<{ r: number; c: number } | null>(null);
-  const satelliteHeight = 85;
+  const satelliteHeight = 50;
   const [renderNonce, setRenderNonce] = useState<number>(0);
 
   const dragStartPos = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
@@ -752,19 +752,56 @@ export default function Terrain3DViewer({
   const minElev = elev?.min_elevation ?? 0;
   const maxElev = elev?.max_elevation ?? 50;
 
+  // Relief below this span renders nearly flat: stops metre-scale noise on
+  // plains from stretching into mountains (full-span normalization artifact).
+  const FLATTEN_SPAN_M = 25;
+
   // Elevation grid
   const elevGrid: number[][] = useMemo(() => {
-    if (elev?.grid && elev.grid.length > 0) return elev.grid;
-    const grid: number[][] = [];
-    for (let r = 0; r < rows; r++) {
-      const row: number[] = [];
-      for (let c = 0; c < cols; c++) {
-        const u = c / (cols - 1);
-        const v = r / (rows - 1);
-        const val = minElev + (maxElev - minElev) * (0.3 + 0.7 * Math.sin(u * Math.PI) * Math.cos(v * Math.PI));
-        row.push(val);
+    let grid: number[][];
+    if (elev?.grid && elev.grid.length > 0) {
+      grid = elev.grid.map((row) => [...row]);
+    } else {
+      grid = [];
+      for (let r = 0; r < rows; r++) {
+        const row: number[] = [];
+        for (let c = 0; c < cols; c++) {
+          const u = c / Math.max(1, cols - 1);
+          const v = r / Math.max(1, rows - 1);
+          // Gentle ±8% undulation around mid-relief (never hills, never pits)
+          const t = 0.5 + 0.08 * Math.sin(u * Math.PI * 2) * Math.cos(v * Math.PI * 2);
+          row.push(minElev + (maxElev - minElev) * Math.min(1, Math.max(0, t)));
+        }
+        grid.push(row);
       }
-      grid.push(row);
+    }
+    // Percentile clamp kills DEM outliers (single pits/spikes bend tiles)
+    const flat: number[] = [];
+    for (const row of grid) for (const v of row) flat.push(v);
+    if (flat.length > 0) {
+      const sorted = [...flat].sort((a, b) => a - b);
+      const lo = sorted[Math.floor(sorted.length * 0.01)];
+      const hi = sorted[Math.max(0, Math.ceil(sorted.length * 0.99) - 1)];
+      if (hi > lo) {
+        for (let r = 0; r < grid.length; r++) {
+          for (let c = 0; c < grid[r].length; c++) {
+            grid[r][c] = Math.min(hi, Math.max(lo, grid[r][c]));
+          }
+        }
+      }
+    }
+    // One 3x3 box-blur pass removes single-cell steps between tiles
+    const R = grid.length;
+    const C = grid[0]?.length || 0;
+    if (R >= 3 && C >= 3) {
+      const src = grid.map((row) => [...row]);
+      for (let r = 1; r < R - 1; r++) {
+        for (let c = 1; c < C - 1; c++) {
+          let s = 0;
+          for (let dr = -1; dr <= 1; dr++) for (let dc = -1; dc <= 1; dc++) s += src[r + dr][c + dc];
+          grid[r][c] = s / 9;
+        }
+      }
     }
     return grid;
   }, [elev, rows, cols, minElev, maxElev]);
@@ -821,6 +858,9 @@ export default function Terrain3DViewer({
     const tileSouth = b.north - v1 * (b.north - b.south);
     const tileLat = (tileNorth + tileSouth) / 2;
     const tileLon = (tileWest + tileEast) / 2;
+    // Real-world footprint: 1° latitude ≈ 111.32 km; longitude shrinks by cos(lat)
+    const tileHeightKm = (tileNorth - tileSouth) * 111.32;
+    const tileWidthKm = (tileEast - tileWest) * 111.32 * Math.cos((tileLat * Math.PI) / 180);
 
     const e00 = elevGrid[r]?.[c] ?? minElev;
     const e10 = elevGrid[r]?.[c + 1] ?? minElev;
@@ -845,6 +885,8 @@ export default function Terrain3DViewer({
       tileSouth,
       tileLat,
       tileLon,
+      tileWidthKm,
+      tileHeightKm,
       avgElev,
       avgHazard,
       normH,
@@ -904,7 +946,8 @@ export default function Terrain3DViewer({
     const project = (u: number, v: number, zMeters: number) => {
       const nx = (u - 0.5) * 2;
       const ny = (v - 0.5) * 2;
-      const normZ = ((zMeters - minElev) / elevSpan) * 0.55 * zExaggeration;
+      // Flattened span: sub-25m relief stays near-flat instead of becoming mountains
+      const normZ = ((zMeters - minElev) / Math.max(elevSpan, FLATTEN_SPAN_M)) * 0.55 * zExaggeration;
 
       // Rotate around Z axis (yaw)
       const rx = nx * cosY - ny * sinY;
@@ -1903,7 +1946,6 @@ export default function Terrain3DViewer({
         const r = Math.min(rows - 1, Math.max(0, Math.floor(v * rows)));
         const c = Math.min(cols - 1, Math.max(0, Math.floor(u * cols)));
         const groundE = elevGrid[r]?.[c] ?? minElev;
-        let heightM = Math.max(1.5, bd.height_m || (bd.levels || 1) * 3.2);
 
         const wA = currentHazardGrid[r]?.[c] ?? 0;
         const wB = nextHazardGrid[r]?.[c] ?? wA;
@@ -1912,19 +1954,13 @@ export default function Terrain3DViewer({
         const isImp = isCellHazardActive(hazardType, cellH, peakVal);
         const normH = getNormHazard(hazardType, cellH, peakVal);
 
-        // Dynamic seismic sway or aerodynamic displacement
+        // Dynamic seismic sway or aerodynamic displacement (lateral only; no height)
         let swayU = 0;
         let swayV = 0;
-        let bldgDispZ = 0;
 
         if (hazardType === 'earthquake' && physicsEnabled && isImp) {
-          bldgDispZ = Math.sin(wavePhase * 4.2 - Math.hypot(u - 0.5, v - 0.5) * 22.0) * normH * 3.5;
           swayU = Math.sin(wavePhase * 8.0 + u * 40.0) * 0.003 * normH;
           swayV = Math.cos(wavePhase * 7.5 + v * 40.0) * 0.003 * normH;
-          // Structural collapse height reduction for catastrophic MMI
-          if (normH > 0.75) {
-            heightM *= 0.65;
-          }
         } else if (hazardType === 'cyclone' && physicsEnabled && isImp) {
           swayU = Math.sin(wavePhase * 5.0) * 0.002 * normH;
         } else if (hazardType === 'landslide' && isImp && normH > 0.4) {
@@ -1946,19 +1982,12 @@ export default function Terrain3DViewer({
           }
         }
 
-        const base = project(u, v, groundE + bldgDispZ);
-        const top = project(u + swayU, v + swayV, groundE + bldgDispZ + heightM);
-
-        ctx.beginPath();
-        ctx.moveTo(base.x, base.y);
-        ctx.lineTo(top.x, top.y);
-        ctx.strokeStyle = col;
-        ctx.lineWidth = isImp ? 3.5 : 2.5;
-        ctx.stroke();
-
-        // Cap square at roof height
+        // Flat surface marker: buildings sit on the terrain with no height
+        // projection (meter-height columns exaggerated into sky spikes).
+        const base = project(u + swayU, v + swayV, groundE);
         ctx.fillStyle = col;
-        ctx.fillRect(top.x - 2.5, top.y - 2.5, 5, 5);
+        const half = isImp ? 3.5 : 2.5;
+        ctx.fillRect(base.x - half, base.y - half, half * 2, half * 2);
 
         // Hazard-specific building effects
         if (isImp && physicsEnabled) {
@@ -1969,20 +1998,20 @@ export default function Terrain3DViewer({
             ctx.lineWidth = 1;
             ctx.strokeRect(base.x - 4, base.y - 2, 8, 4);
           } else if (hazardType === 'wildfire' && normH > 0.15) {
-            // Flickering fire tongue on the building rooftop
+            // Flickering fire tongue above the ground marker
             const flameFlicker = Math.sin(wavePhase * 7.0 + u * 30.0) * 2.0;
             ctx.fillStyle = '#fef08a';
             ctx.beginPath();
-            ctx.moveTo(top.x - 2, top.y);
-            ctx.lineTo(top.x, top.y - 6 - flameFlicker);
-            ctx.lineTo(top.x + 2, top.y);
+            ctx.moveTo(base.x - 2, base.y);
+            ctx.lineTo(base.x, base.y - 6 - flameFlicker);
+            ctx.lineTo(base.x + 2, base.y);
             ctx.closePath();
             ctx.fill();
           } else if (hazardType === 'earthquake' && normH > 0.5) {
             // Seismic damage alert indicator
             ctx.strokeStyle = 'rgba(239, 68, 68, 0.7)';
             ctx.lineWidth = 1;
-            ctx.strokeRect(top.x - 4, top.y - 4, 8, 8);
+            ctx.strokeRect(base.x - 4, base.y - 4, 8, 8);
           } else if (hazardType === 'landslide' && normH > 0.3) {
             // Mud splatter around foundation
             ctx.fillStyle = '#78350f';
@@ -2686,7 +2715,7 @@ export default function Terrain3DViewer({
                   <div className="terrain3d-sat-card-alt-box">
                     <div className="terrain3d-sat-alt-header">
                       <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}><IconSatellite size={13} color="#38bdf8" /> Satellite Height (Altitude):</span>
-                      <strong className="terrain3d-sat-alt-val">+85 meters</strong>
+                      <strong className="terrain3d-sat-alt-val">+{Math.round(satelliteHeight)} meters</strong>
                     </div>
                   </div>
 
@@ -2700,6 +2729,12 @@ export default function Terrain3DViewer({
                       <span className="terrain3d-sat-stat-lbl">Center Coordinates:</span>
                       <span className="terrain3d-sat-stat-val">
                         {selectedTileData.tileLat.toFixed(4)}&deg;N, {selectedTileData.tileLon.toFixed(4)}&deg;E
+                      </span>
+                    </div>
+                    <div className="terrain3d-sat-stat-row">
+                      <span className="terrain3d-sat-stat-lbl">Tile Footprint:</span>
+                      <span className="terrain3d-sat-stat-val">
+                        {selectedTileData.tileWidthKm.toFixed(2)} km &times; {selectedTileData.tileHeightKm.toFixed(2)} km
                       </span>
                     </div>
                     <div className="terrain3d-sat-stat-row">
@@ -2764,15 +2799,22 @@ export default function Terrain3DViewer({
 
 
 
-              {/* ─── Floating 3D Timeline & Real-Time Physics Controller ─── */}
+              {/* ─── Single Bottom Bar: timeline (left) + compact zoom (right) ─── */}
               <div
-                className="terrain3d-floating-timeline"
+                className="terrain3d-bottombar"
                 onMouseDown={(e) => e.stopPropagation()}
                 onMouseMove={(e) => e.stopPropagation()}
                 onMouseUp={(e) => e.stopPropagation()}
                 onTouchStart={(e) => e.stopPropagation()}
                 onTouchMove={(e) => e.stopPropagation()}
+                onWheel={(e) => {
+                  e.stopPropagation();
+                  const dy = e.deltaY;
+                  const factor = dy < 0 ? 1.15 : 0.87;
+                  setZoom((z) => Math.max(0.6, Math.min(6.5, +(z * factor).toFixed(2))));
+                }}
               >
+                <div className="terrain3d-bottombar-left">
                 <button
                   className="terrain3d-timeline-play-btn"
                   onClick={togglePlay}
@@ -2843,50 +2885,40 @@ export default function Terrain3DViewer({
                   )}
                   <span>{physicsLabel}: {physicsEnabled ? 'ON' : 'OFF'}</span>
                 </button>
+                </div>
+                <div className="terrain3d-bottombar-right">
+                  <span className="terrain3d-zoom-compact-label">Zoom</span>
+                  <button
+                    type="button"
+                    className="terrain3d-zoom-btn terrain3d-zoom-btn--compact"
+                    onClick={() => setZoom((z) => Math.max(0.6, +(z - 0.25).toFixed(2)))}
+                    title="Zoom Out (-)"
+                  >
+                    &minus;
+                  </button>
+                  <input
+                    type="range"
+                    className="terrain3d-zoom-compact-slider"
+                    min="0.6"
+                    max="6.5"
+                    step="0.05"
+                    value={zoom}
+                    onChange={(e) => setZoom(Number(e.target.value))}
+                    aria-label="3D zoom"
+                  />
+                  <button
+                    type="button"
+                    className="terrain3d-zoom-btn terrain3d-zoom-btn--compact"
+                    onClick={() => setZoom((z) => Math.min(6.5, +(z + 0.25).toFixed(2)))}
+                    title="Zoom In (+)"
+                  >
+                    +
+                  </button>
+                  <strong className="terrain3d-zoom-compact-val">{zoom.toFixed(1)}&times;</strong>
+                </div>
               </div>
             </div>
-
-            {/* Bottom Zoom and Controls Bar */}
-            <div
-              className="terrain3d-zoombar"
-              onMouseDown={(e) => e.stopPropagation()}
-              onTouchStart={(e) => e.stopPropagation()}
-              onWheel={(e) => {
-                e.stopPropagation();
-                const dy = e.deltaY;
-                const factor = dy < 0 ? 1.15 : 0.87;
-                setZoom((z) => Math.max(0.6, Math.min(6.5, +(z * factor).toFixed(2))));
-              }}
-            >
-              <span>Zoom</span>
-              <button
-                type="button"
-                className="terrain3d-zoom-btn"
-                onClick={() => setZoom((z) => Math.max(0.6, +(z - 0.25).toFixed(2)))}
-                title="Zoom Out (-)"
-              >
-                &minus;
-              </button>
-              <input
-                type="range"
-                min="0.6"
-                max="6.5"
-                step="0.05"
-                value={zoom}
-                onChange={(e) => setZoom(Number(e.target.value))}
-                aria-label="3D zoom"
-              />
-              <button
-                type="button"
-                className="terrain3d-zoom-btn"
-                onClick={() => setZoom((z) => Math.min(6.5, +(z + 0.25).toFixed(2)))}
-                title="Zoom In (+)"
-              >
-                +
-              </button>
-              <strong>{zoom.toFixed(1)}&times;</strong>
             </div>
-          </div>
         </div>
       </div>
     </div>
