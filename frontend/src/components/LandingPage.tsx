@@ -15,6 +15,7 @@ declare global {
   }
 }
 
+const THREE_LOCAL = '/three.min.js';
 const THREE_CDN = 'https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js';
 const EARTH_TEX =
   'https://raw.githubusercontent.com/mrdoob/three.js/master/examples/textures/planets/earth_atmos_2048.jpg';
@@ -24,18 +25,27 @@ const CLOUDS_TEX =
 function loadThree(): Promise<any> {
   if (window.THREE) return Promise.resolve(window.THREE);
   return new Promise((resolve, reject) => {
-    const existing = document.querySelector('script[data-three-cdn]');
+    const existing = document.querySelector('script[data-three-loader]');
     if (existing) {
       existing.addEventListener('load', () => resolve(window.THREE));
-      existing.addEventListener('error', () => reject(new Error('three.js CDN failed')));
+      existing.addEventListener('error', () => reject(new Error('three.js load failed')));
       return;
     }
     const s = document.createElement('script');
-    s.src = THREE_CDN;
+    s.src = THREE_LOCAL;
     s.async = true;
-    s.setAttribute('data-three-cdn', '1');
+    s.setAttribute('data-three-loader', '1');
     s.onload = () => resolve(window.THREE);
-    s.onerror = () => reject(new Error('three.js CDN failed'));
+    s.onerror = () => {
+      // Fallback to CDN if local bundle fails
+      const fallback = document.createElement('script');
+      fallback.src = THREE_CDN;
+      fallback.async = true;
+      fallback.setAttribute('data-three-loader', '1');
+      fallback.onload = () => resolve(window.THREE);
+      fallback.onerror = () => reject(new Error('three.js CDN failed'));
+      document.head.appendChild(fallback);
+    };
     document.head.appendChild(s);
   });
 }

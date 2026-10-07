@@ -292,6 +292,17 @@ class ResearchChatRequest(BaseModel):
 
 # ─── API Endpoints ────────────────────────────────────────────────
 
+@app.get("/")
+async def root():
+    return {
+        "service": "DisasterLens (TerraLab API)",
+        "status": "online",
+        "frontend_ui": "http://localhost:5173",
+        "api_docs": "/docs",
+        "health": "/api/health",
+    }
+
+
 @app.get("/api/health")
 async def health_check():
     return {

@@ -117,7 +117,7 @@ def _detect_optical_satellite(
                         "lon": round(lon, 5),
                         "area_sqm": sqm,
                         "confidence": 0.89,
-                        "source": "ArcGIS Optical Satellite AI",
+                        "source": "OpenCV Optical Satellite AI",
                     }
                 )
 
@@ -143,7 +143,7 @@ def _detect_optical_satellite(
                         "lon": round(lon, 5),
                         "area_sqm": sqm,
                         "confidence": 0.92,
-                        "source": "ArcGIS Optical Satellite AI",
+                        "source": "OpenCV Optical Satellite AI",
                     }
                 )
 
@@ -166,7 +166,7 @@ def _detect_optical_satellite(
                         "lon": round(lon, 5),
                         "area_sqm": round(area_px * px_area_sqm, 1),
                         "confidence": 0.86,
-                        "source": "ArcGIS Optical Satellite AI",
+                        "source": "OpenCV Optical Satellite AI",
                     }
                 )
 
@@ -207,7 +207,7 @@ def _detect_optical_satellite(
                                     "lon": round(lon, 5),
                                     "area_sqm": round(area * px_area_sqm, 1),
                                     "confidence": 0.84,
-                                    "source": "ArcGIS Optical Satellite AI (Unmapped in OSM)",
+                                    "source": "OpenCV Optical Satellite AI (Unmapped in OSM)",
                                 }
                             )
 
@@ -285,7 +285,7 @@ def detect_objects(
             is_synthetic = bool(data.get("is_synthetic", False))
 
             def _source_of(feat: Dict[str, Any]) -> str:
-                return "synthetic" if feat.get("source") == "synthetic" else "OpenStreetMap"
+                return "synthetic" if feat.get("source") == "synthetic" else "Overpass API (OpenStreetMap)"
 
             def _discount(conf: float, feat: Dict[str, Any]) -> float:
                 if feat.get("source") == "synthetic":
