@@ -28,13 +28,15 @@ def fetch_elevation_grid(
     Fetch elevation data as a 2D grid for a bounding box with slope and aspect.
     Checks spatial cache first for instant response.
     """
-    max_grid_size = 25
+    max_grid_size = 36
     center_lat = (south + north) / 2.0
     lat_span = max(abs(north - south), 0.001)
     lon_span = max(abs(east - west), 0.001)
     cos_lat = max(0.05, math.cos(math.radians(center_lat)))
 
-    # Compute grid dimensions matching resolution, clamped to max_grid_size for 1-2s simulation speed
+    # Compute grid dimensions matching resolution, clamped to max_grid_size.
+    # 36x36 cap (≈90m cells) feeds the 3D terrain mesh real samples instead of
+    # blocky 25x25 cells; results are spatially cached so repeat runs stay fast.
     raw_rows = max(10, int(lat_span / (resolution_m / 111320.0)))
     raw_cols = max(10, int(lon_span / (resolution_m / (111320.0 * cos_lat))))
     rows = min(max_grid_size, raw_rows)
@@ -54,46 +56,68 @@ def fetch_elevation_grid(
     lats = [round(float(v), 6) for v in np.linspace(north, south, rows)]
     lons = [round(float(v), 6) for v in np.linspace(west, east, cols)]
 
-    all_points = [(lat_val, lon_val) for lat_val in lats for lon_val in lons]
-    total_points = len(all_points)
-    
-    batch_size = 100
-    all_elevations = []
-    api_failed = False
-    
-    for i in range(0, total_points, batch_size):
-        batch = all_points[i:i + batch_size]
-        lat_str = ",".join([str(p[0]) for p in batch])
-        lon_str = ",".join([str(p[1]) for p in batch])
-        
-        try:
-            response = requests.get(
-                config.ELEVATION_API_URL,
-                params={"latitude": lat_str, "longitude": lon_str},
-                timeout=3,
-            )
-            if response.status_code == 429:
-                logger.warning(f"[Elevation] Open-Meteo 429 rate limit reached. Using synthetic terrain.")
+    # 1. Primary: AWS Terrain Tiles (free, unlimited, 30m). Tile fetch +
+    #    bilinear sampling — no per-point batching, no 429 rate limits.
+    dem_source = "Copernicus GLO-30 DEM via Open-Meteo"
+    try:
+        from geodata.elevation_tiles import fetch_terrarium_grid
+        terr = fetch_terrarium_grid(south, west, north, east, rows, cols)
+        elevation_grid = terr["grid"]
+        dem_source = terr["source"]
+        _fill_nan_neighbors(elevation_grid)
+        is_synthetic = bool(np.isnan(elevation_grid).any())
+        if is_synthetic:
+            raise ValueError("Terrarium grid has voids after fill")
+    except Exception as e:
+        logger.warning(f"[Elevation] Terrain tiles unavailable ({e}); trying Open-Meteo.")
+        elevation_grid = None
+        is_synthetic = True
+
+    # 2. Fallback: Open-Meteo point-query API (rate-limited, 429s possible)
+    if elevation_grid is None:
+        dem_source = "Copernicus GLO-30 DEM via Open-Meteo"
+
+        all_points = [(lat_val, lon_val) for lat_val in lats for lon_val in lons]
+        total_points = len(all_points)
+
+        batch_size = 100
+        all_elevations = []
+        api_failed = False
+
+        for i in range(0, total_points, batch_size):
+            batch = all_points[i:i + batch_size]
+            lat_str = ",".join([str(p[0]) for p in batch])
+            lon_str = ",".join([str(p[1]) for p in batch])
+
+            try:
+                response = requests.get(
+                    config.ELEVATION_API_URL,
+                    params={"latitude": lat_str, "longitude": lon_str},
+                    timeout=6,
+                )
+                if response.status_code == 429:
+                    logger.warning("[Elevation] Open-Meteo 429 rate limit reached. Using synthetic terrain.")
+                    api_failed = True
+                    break
+                response.raise_for_status()
+                data = response.json()
+                elevations = data.get("elevation", [])
+                all_elevations.extend(elevations)
+            except Exception as e:
+                logger.warning(f"[Elevation] Notice: {e}. Falling back to deterministic terrain.")
                 api_failed = True
                 break
-            response.raise_for_status()
-            data = response.json()
-            elevations = data.get("elevation", [])
-            all_elevations.extend(elevations)
-        except Exception as e:
-            logger.warning(f"[Elevation] Notice: {e}. Falling back to deterministic terrain.")
-            api_failed = True
-            break
 
-    if api_failed or len(all_elevations) != total_points:
-        # Fallback terrain generation (deterministic gradient based on latitude/longitude)
-        logger.info("[Elevation] Generating deterministic terrain from bounding coordinates")
-        elevation_grid = _generate_synthetic_terrain(rows, cols, south, north, west, east)
-        is_synthetic = True
-    else:
-        elevation_grid = np.array(all_elevations, dtype=np.float64).reshape(rows, cols)
-        _fill_nan_neighbors(elevation_grid)
-        is_synthetic = False
+        if api_failed or len(all_elevations) != total_points:
+            # 3. Last resort: deterministic modeled terrain (clearly flagged).
+            logger.info("[Elevation] Generating deterministic terrain from bounding coordinates")
+            elevation_grid = _generate_synthetic_terrain(rows, cols, south, north, west, east)
+            is_synthetic = True
+            dem_source = "Modeled fallback terrain (offline)"
+        else:
+            elevation_grid = np.array(all_elevations, dtype=np.float64).reshape(rows, cols)
+            _fill_nan_neighbors(elevation_grid)
+            is_synthetic = False
 
     slope_deg, aspect_deg = calculate_slope_and_aspect(elevation_grid, resolution_m)
     
@@ -107,6 +131,7 @@ def fetch_elevation_grid(
         "lons": lons,
         "resolution_m": resolution_m,
         "is_synthetic": is_synthetic,
+        "source": dem_source,
     }
     
     # Save to spatial cache

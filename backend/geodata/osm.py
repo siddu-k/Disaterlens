@@ -31,7 +31,8 @@ _ROADS_AMENITIES_QUERY = """
 [out:json][timeout:25];
 (
   way["highway"]({bbox});
-  nwr["amenity"~"^(hospital|shelter|school|police|fire_station)$"]({bbox});
+  nwr["amenity"~"^(hospital|clinic|doctors|pharmacy|shelter|school|college|university|kindergarten|police|fire_station)$"]({bbox});
+  nwr["emergency"="assembly_point"]({bbox});
 );
 out geom;
 """
@@ -92,6 +93,7 @@ def fetch_geodata(
     west: float,
     north: float,
     east: float,
+    skip_osm_buildings: bool = False,
 ) -> Dict[str, Any]:
     """
     Fetch all relevant geospatial data live for the exact requested bounding box from OSM Overpass.
@@ -99,6 +101,11 @@ def fetch_geodata(
     each with retry + mirror failover. Partial success is kept (real parts stay real,
     failed parts fall back to synthetic). Fully-live payloads are cached; synthetic
     payloads are never cached so the next run retries live sources.
+
+    skip_osm_buildings: when Microsoft GlobalML already covers houses for this
+    bbox, skip the heavy 60s buildings query so Overpass only serves roads +
+    facilities (hospitals/schools/...). The caller fuses MS houses afterwards.
+    Skipped payloads are never cached and never get synthetic filler buildings.
     """
     bbox = f"{south},{west},{north},{east}"
     logger.info(f"[OSM] Live fetch from Overpass API for AOI bbox: {bbox}")
@@ -124,12 +131,15 @@ def fetch_geodata(
     except Exception as e:
         synthetic_parts.extend(["roads", "amenities"])
         logger.warning(f"[OSM] roads/amenities unavailable for {bbox}: {e}")
-    try:
-        elements.extend(_fetch_overpass_elements(
-            _BUILDINGS_QUERY.format(bbox=bbox), _BUILDINGS_TIMEOUT_S, "buildings"))
-    except Exception as e:
-        synthetic_parts.append("buildings")
-        logger.warning(f"[OSM] buildings unavailable for {bbox}: {e}")
+    if skip_osm_buildings:
+        logger.info(f"[OSM] buildings query skipped for {bbox} (MS GlobalML covers houses)")
+    else:
+        try:
+            elements.extend(_fetch_overpass_elements(
+                _BUILDINGS_QUERY.format(bbox=bbox), _BUILDINGS_TIMEOUT_S, "buildings"))
+        except Exception as e:
+            synthetic_parts.append("buildings")
+            logger.warning(f"[OSM] buildings unavailable for {bbox}: {e}")
 
     if len(synthetic_parts) >= 3:  # every part failed — full procedural fallback
         logger.warning(f"[OSM] All Overpass requests failed for {bbox}. Generating procedural geodata.")
@@ -154,7 +164,7 @@ def fetch_geodata(
             building = _parse_building(elem, tags)
             if building:
                 buildings.append(building)
-        elif tags.get("amenity") == "hospital":
+        elif tags.get("amenity") in ("hospital", "clinic", "doctors", "pharmacy"):
             facility = _parse_facility(elem, tags, "hospital")
             if facility:
                 hospitals.append(facility)
@@ -170,13 +180,14 @@ def fetch_geodata(
             facility = _parse_facility(elem, tags, "fire_station")
             if facility:
                 fire_stations.append(facility)
-        elif tags.get("amenity") == "school":
+        elif tags.get("amenity") in ("school", "college", "university", "kindergarten"):
             facility = _parse_facility(elem, tags, "school")
             if facility:
                 schools.append(facility)
 
     # Ensure buildings are never empty if query returns 0 building polygons
-    if len(buildings) == 0 and len(roads) > 0:
+    # (skipped when MS covers houses — fusion fills them, no synthetic filler).
+    if len(buildings) == 0 and len(roads) > 0 and not skip_osm_buildings:
         b_id = 8000
         for road in roads[:80]:
             for pt in road["coords"]:
@@ -229,10 +240,12 @@ def fetch_geodata(
         "dataset_name": f"OSM Bounding Box ({round(south,3)}, {round(west,3)} to {round(north,3)}, {round(east,3)})",
         "is_synthetic": bool(synthetic_parts),
         "synthetic_parts": synthetic_parts,
+        "osm_buildings_skipped": bool(skip_osm_buildings),
     }
-    if not synthetic_parts:
+    if not synthetic_parts and not skip_osm_buildings:
         # Cache only fully-live payloads. Synthetic fallbacks must retry live
         # sources on the next run instead of being served from cache forever.
+        # MS-skipped payloads (empty OSM buildings) are never cached either.
         try:
             save_cached_geodata(south, west, north, east, result)
         except Exception as e:

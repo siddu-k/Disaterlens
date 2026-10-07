@@ -51,7 +51,7 @@ export default function SatVisionPanel({
   };
   const [detectOpen, setDetectOpen] = useState(false);
   const [diffOpen, setDiffOpen] = useState(false);
-  const [modelMode, setModelMode] = useState<'hybrid' | 'osm-vector'>('hybrid');
+  const [modelMode, setModelMode] = useState<'hybrid' | 'ms-footprints' | 'osm-vector'>('hybrid');
   const [objectTypes, setObjectTypes] = useState<string[]>(['building', 'road', 'water', 'tree', 'solar']);
   const [detectLoading, setDetectLoading] = useState(false);
   const [detectError, setDetectError] = useState<string | null>(null);
@@ -194,9 +194,27 @@ export default function SatVisionPanel({
                       borderRadius: 4,
                       cursor: 'pointer',
                     }}
-                    title="Real-time optical satellite AI (ArcGIS) fused with OSM. Detects water, trees, solar, and unmapped buildings."
+                    title="Both: OSM vectors + Microsoft GlobalML footprints + optical satellite AI. Houses from MS + optical, roads from Overpass."
                   >
-                    ✦ Optical AI Vision (Hybrid)
+                    ✦ Hybrid (Both)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setModelMode('ms-footprints')}
+                    style={{
+                      flex: 1,
+                      padding: '4px 6px',
+                      fontSize: 10.5,
+                      fontWeight: modelMode === 'ms-footprints' ? 600 : 400,
+                      background: modelMode === 'ms-footprints' ? '#1e293b' : 'transparent',
+                      color: modelMode === 'ms-footprints' ? '#38bdf8' : '#94a3b8',
+                      border: 'none',
+                      borderRadius: 4,
+                      cursor: 'pointer',
+                    }}
+                    title="Fast Microsoft GlobalML building footprints (precomputed DNN, 1.4B buildings) + OSM roads. No 640px image fetch."
+                  >
+                    ⚡ MS Fast
                   </button>
                   <button
                     type="button"
@@ -212,9 +230,9 @@ export default function SatVisionPanel({
                       borderRadius: 4,
                       cursor: 'pointer',
                     }}
-                    title="Pure OpenStreetMap vector data baseline"
+                    title="Overpass only: pure OpenStreetMap vector baseline"
                   >
-                    OSM Vector Only
+                    OSM Only
                   </button>
                 </div>
 
@@ -275,8 +293,8 @@ export default function SatVisionPanel({
                             <span className="facility-list-name">{String(d.type)} • {(d.confidence * 100).toFixed(0)}%</span>
                           </span>
                           {d.source && (
-                            <span style={{ fontSize: 9.5, color: d.source.includes('Optical') ? '#38bdf8' : '#94a3b8', paddingLeft: 17 }}>
-                              {d.source.includes('Unmapped') ? '✦ Satellite Unmapped' : d.source.includes('Optical') ? '✦ Satellite AI' : 'OSM Vector'}
+                            <span style={{ fontSize: 9.5, color: d.source.includes('Microsoft') ? '#a78bfa' : d.source.includes('Optical') ? '#38bdf8' : '#94a3b8', paddingLeft: 17 }}>
+                              {d.source.includes('Unmapped') ? '✦ Satellite Unmapped' : d.source.includes('Microsoft') ? '⚡ MS Footprint' : d.source.includes('Optical') ? '✦ Satellite AI' : 'OSM Vector'}
                             </span>
                           )}
                         </span>

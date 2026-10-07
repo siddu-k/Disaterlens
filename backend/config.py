@@ -17,8 +17,13 @@ if os.path.exists(_env_path):
 # Gemini API Key — set via environment variable
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
-# Open-Meteo Elevation API
+# Open-Meteo Elevation API (fallback source: Copernicus GLO-30, rate-limited)
 ELEVATION_API_URL = "https://api.open-meteo.com/v1/elevation"
+
+# AWS Terrain Tiles — primary DEM: Terrarium-encoded 30m SRTM-class elevation,
+# free, no API key, CDN-backed (no 429 rate limits like point-query APIs).
+TERRAIN_TILES_URL = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"
+TERRAIN_TILES_ZOOM = 15  # z15 tiles sample the underlying 30m DEM natively
 
 # Overpass API
 OVERPASS_API_URL = "https://overpass-api.de/api/interpreter"

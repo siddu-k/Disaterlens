@@ -48,6 +48,13 @@ def _ensure_created_at_columns(conn: sqlite3.Connection) -> None:
         columns = {row[1] for row in cur.fetchall()}
         if "created_at" not in columns:
             cur.execute(f"ALTER TABLE {table} ADD COLUMN created_at REAL")
+    if "elevation_cache" in existing_tables:
+        cur.execute("PRAGMA table_info(elevation_cache)")
+        ecol = {row[1] for row in cur.fetchall()}
+        if "is_synthetic" not in ecol:
+            cur.execute("ALTER TABLE elevation_cache ADD COLUMN is_synthetic INTEGER DEFAULT 0")
+        if "source" not in ecol:
+            cur.execute("ALTER TABLE elevation_cache ADD COLUMN source TEXT")
 
 
 def _init_sqlite_db():
@@ -77,7 +84,9 @@ def _init_sqlite_db():
                 min_elevation REAL,
                 max_elevation REAL,
                 elevation_json TEXT,
-                created_at REAL
+                created_at REAL,
+                is_synthetic INTEGER DEFAULT 0,
+                source TEXT
             )
         """)
 
@@ -125,12 +134,14 @@ def get_bbox_hash(
     resolution_m: Optional[float] = None,
     rows: Optional[int] = None,
     cols: Optional[int] = None,
+    salt: str = "",
 ) -> str:
     """
     Generate deterministic hash for spatial bounding box.
     Optional resolution_m/rows/cols segments make the key resolution-aware
     when those params are available at the call site; omitted (None) segments
     are excluded so existing callers produce identical hashes to before.
+    salt versions a key namespace (used to orphan poisoned legacy rows).
     """
     key = f"{round(south, precision)},{round(west, precision)},{round(north, precision)},{round(east, precision)}"
     if resolution_m is not None:
@@ -139,6 +150,8 @@ def get_bbox_hash(
         key += f"|rows={rows}"
     if cols is not None:
         key += f"|cols={cols}"
+    if salt:
+        key += f"|salt={salt}"
     return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
 
 
@@ -212,22 +225,32 @@ def get_cached_elevation(
     rows: Optional[int] = None,
     cols: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Retrieve cached elevation grid if available (resolution-aware when params given)."""
-    h = get_bbox_hash(south, west, north, east, resolution_m=resolution_m, rows=rows, cols=cols)
+    """Retrieve cached elevation grid if available (resolution-aware when params given).
+
+    Salt "elev-v2" orphans pre-terrarium rows: legacy cache stored synthetic
+    fallback grids without any flag, served as real for 30 days.
+    """
+    h = get_bbox_hash(south, west, north, east, resolution_m=resolution_m, rows=rows, cols=cols, salt="elev-v2")
     conn = _connect()
     try:
         cur = conn.cursor()
-        cur.execute("""
-            SELECT rows, cols, resolution_m, min_elevation, max_elevation, elevation_json
-            FROM elevation_cache WHERE bbox_hash = ?
-        """, (h,))
+        try:
+            cur.execute("""
+                SELECT rows, cols, resolution_m, min_elevation, max_elevation, elevation_json, is_synthetic, source
+                FROM elevation_cache WHERE bbox_hash = ?
+            """, (h,))
+        except Exception:
+            cur.execute("""
+                SELECT rows, cols, resolution_m, min_elevation, max_elevation, elevation_json
+                FROM elevation_cache WHERE bbox_hash = ?
+            """, (h,))
         row = cur.fetchone()
     finally:
         conn.close()
     if row and row[5]:
         try:
             elev_data = json.loads(row[5])
-            return {
+            out = {
                 "rows": row[0],
                 "cols": row[1],
                 "resolution_m": row[2],
@@ -235,36 +258,61 @@ def get_cached_elevation(
                 "max_elevation": row[4],
                 "elevation": np.array(elev_data, dtype=np.float64),
             }
+            if len(row) > 7:
+                out["is_synthetic"] = bool(row[6])
+                out["source"] = row[7]
+            return out
         except Exception:
             return None
     return None
 
 
 def save_cached_elevation(south: float, west: float, north: float, east: float, result: Dict[str, Any]) -> None:
-    """Save elevation grid to cache."""
+    """Save elevation grid to cache. Synthetic fallbacks are NEVER cached —
+    the next run must retry live sources instead of serving fake terrain."""
+    if result.get("is_synthetic"):
+        return
     h = get_bbox_hash(
         south, west, north, east,
         resolution_m=result.get("resolution_m"),
         rows=result.get("rows"),
         cols=result.get("cols"),
+        salt="elev-v2",
     )
     elevation_list = result["elevation"].tolist() if isinstance(result["elevation"], np.ndarray) else result["elevation"]
     conn = _connect()
     try:
         cur = conn.cursor()
-        cur.execute("""
-            INSERT OR REPLACE INTO elevation_cache (bbox_hash, rows, cols, resolution_m, min_elevation, max_elevation, elevation_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            h,
-            result["rows"],
-            result["cols"],
-            result["resolution_m"],
-            float(np.nanmin(result["elevation"])),
-            float(np.nanmax(result["elevation"])),
-            json.dumps(elevation_list),
-            time.time()
-        ))
+        try:
+            cur.execute("""
+                INSERT OR REPLACE INTO elevation_cache (bbox_hash, rows, cols, resolution_m, min_elevation, max_elevation, elevation_json, created_at, is_synthetic, source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                h,
+                result["rows"],
+                result["cols"],
+                result["resolution_m"],
+                float(np.nanmin(result["elevation"])),
+                float(np.nanmax(result["elevation"])),
+                json.dumps(elevation_list),
+                time.time(),
+                1 if result.get("is_synthetic") else 0,
+                result.get("source"),
+            ))
+        except Exception:
+            cur.execute("""
+                INSERT OR REPLACE INTO elevation_cache (bbox_hash, rows, cols, resolution_m, min_elevation, max_elevation, elevation_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                h,
+                result["rows"],
+                result["cols"],
+                result["resolution_m"],
+                float(np.nanmin(result["elevation"])),
+                float(np.nanmax(result["elevation"])),
+                json.dumps(elevation_list),
+                time.time()
+            ))
         conn.commit()
     finally:
         conn.close()

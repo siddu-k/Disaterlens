@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react';
+import * as THREE from 'three';
 import {
   IconBolt,
   IconLocationPin,
@@ -8,47 +9,10 @@ import {
   IconSatellite,
 } from './Icons';
 
-declare global {
-  // three.js is lazy-loaded from CDN (see loadThree) so WebGL never enters our bundle.
-  interface Window {
-    THREE?: any;
-  }
-}
-
-const THREE_LOCAL = '/three.min.js';
-const THREE_CDN = 'https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js';
 const EARTH_TEX =
   'https://raw.githubusercontent.com/mrdoob/three.js/master/examples/textures/planets/earth_atmos_2048.jpg';
 const CLOUDS_TEX =
   'https://raw.githubusercontent.com/mrdoob/three.js/master/examples/textures/planets/earth_clouds_1024.png';
-
-function loadThree(): Promise<any> {
-  if (window.THREE) return Promise.resolve(window.THREE);
-  return new Promise((resolve, reject) => {
-    const existing = document.querySelector('script[data-three-loader]');
-    if (existing) {
-      existing.addEventListener('load', () => resolve(window.THREE));
-      existing.addEventListener('error', () => reject(new Error('three.js load failed')));
-      return;
-    }
-    const s = document.createElement('script');
-    s.src = THREE_LOCAL;
-    s.async = true;
-    s.setAttribute('data-three-loader', '1');
-    s.onload = () => resolve(window.THREE);
-    s.onerror = () => {
-      // Fallback to CDN if local bundle fails
-      const fallback = document.createElement('script');
-      fallback.src = THREE_CDN;
-      fallback.async = true;
-      fallback.setAttribute('data-three-loader', '1');
-      fallback.onload = () => resolve(window.THREE);
-      fallback.onerror = () => reject(new Error('three.js CDN failed'));
-      document.head.appendChild(fallback);
-    };
-    document.head.appendChild(s);
-  });
-}
 
 function BackdropGlobe() {
   const mountRef = useRef<HTMLDivElement>(null);
@@ -65,8 +29,7 @@ function BackdropGlobe() {
     let resizeHandler: (() => void) | null = null;
     let time = Math.random() * 10;
 
-    loadThree()
-      .then((THREE) => {
+    try {
         if (disposed) return;
         const mount = mountRef.current;
         if (!mount) return;
@@ -161,10 +124,9 @@ function BackdropGlobe() {
           renderer.render(scene, camera);
         };
         animate();
-      })
-      .catch(() => {
-        // CDN/texture failure: flat themed backdrop remains.
-      });
+    } catch {
+      // WebGL unavailable: flat themed backdrop remains.
+    }
 
     return () => {
       disposed = true;

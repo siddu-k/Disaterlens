@@ -19,6 +19,10 @@ venv/
 env/
 ENV/
 .python-version
+# Vendored interpreter env mistakenly placed inside backend/
+backend/Lib/
+backend/Scripts/*.exe
+backend/Scripts/*.dll
 pip-log.txt
 pip-delete-this-directory.txt
 .pytest_cache/

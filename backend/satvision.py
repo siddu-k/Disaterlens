@@ -1,16 +1,21 @@
 """
-DisasterLens — Satellite-Vision Proxy (OSM-vector v1)
-=====================================================
+DisasterLens — Satellite-Vision Proxy (Hybrid Optical CV + OSM-vector v2)
+==========================================================================
 Object detection + change detection over detection snapshots.
 
-v1 honesty contract: no ML vision model weights or multi-date imagery keys
-exist in this project, so detections are derived from live OSM vector data
-(real buildings/roads geometry) with deterministic derived confidence.
-NEVER claim a vision model ran — sources are "OpenStreetMap" (live) or
-"synthetic" (offline procedural fallback, confidence discounted).
+Detection split (by design):
+- buildings/houses : Microsoft GlobalML footprints (fast precomputed DNN,
+  1.4B polygons) + OSM vectors (mapped) + OpenCV optical contour CV
+  (unmapped roofs). MS hits labelled "Microsoft GlobalML", optical-only
+  hits "ArcGIS Optical Satellite AI (Unmapped in OSM)".
+- roads (incl. main roads) : OpenStreetMap Overpass vectors ONLY in every
+  mode. Roads are never claimed from optical CV.
+- water/tree/solar : OpenCV spectral CV (NDWI / ExG / HSV) in hybrid and
+  optical-satellite modes.
 
-A real pre-trained vision model can plug in later via MODEL_REGISTRY +
-run_model_inference without changing the endpoint shapes.
+Modes: hybrid (both: OSM + MS + optical), ms-footprints (fast: OSM roads +
+MS buildings, no image fetch), osm-vector (Overpass only),
+optical-satellite (pure optical CV).
 """
 
 import logging
@@ -26,18 +31,28 @@ import cv2
 
 from geodata.osm import fetch_geodata
 
+try:
+    from ms_buildings import fetch_ms_buildings
+except ImportError:  # pragma: no cover - allows running from repo root
+    from backend.ms_buildings import fetch_ms_buildings  # type: ignore
+
 logger = logging.getLogger(__name__)
 
 MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
     "hybrid": {
-        "name": "Hybrid AI (ArcGIS Optical Satellite CV + OSM)",
+        "name": "Hybrid AI (MS Footprints + ArcGIS Optical CV + OSM)",
         "active": True,
-        "notes": "Real-time optical spectral & contour computer vision fused with OSM ground-truth",
+        "notes": "Both: OSM vectors + Microsoft GlobalML footprints + optical spectral & contour CV",
+    },
+    "ms-footprints": {
+        "name": "Microsoft GlobalML Fast (MS Footprints + OSM roads)",
+        "active": True,
+        "notes": "Fast precomputed DNN polygons (1.4B buildings) + OSM roads; no 640px image fetch",
     },
     "osm-vector": {
-        "name": "OSM vector proxy",
+        "name": "OSM vector proxy (Overpass only)",
         "active": True,
-        "notes": "real OSM geometry; pure vector baseline",
+        "notes": "real OSM geometry; pure Overpass baseline",
     },
     "optical-satellite": {
         "name": "ArcGIS High-Res Optical Satellite Vision",
@@ -117,7 +132,7 @@ def _detect_optical_satellite(
                         "lon": round(lon, 5),
                         "area_sqm": sqm,
                         "confidence": 0.89,
-                        "source": "OpenCV Optical Satellite AI",
+                        "source": "ArcGIS Optical Satellite AI",
                     }
                 )
 
@@ -143,7 +158,7 @@ def _detect_optical_satellite(
                         "lon": round(lon, 5),
                         "area_sqm": sqm,
                         "confidence": 0.92,
-                        "source": "OpenCV Optical Satellite AI",
+                        "source": "ArcGIS Optical Satellite AI",
                     }
                 )
 
@@ -166,50 +181,90 @@ def _detect_optical_satellite(
                         "lon": round(lon, 5),
                         "area_sqm": round(area_px * px_area_sqm, 1),
                         "confidence": 0.86,
-                        "source": "OpenCV Optical Satellite AI",
+                        "source": "ArcGIS Optical Satellite AI",
                     }
                 )
 
-    # 4. Unmapped Buildings / Structures: High-contrast rectangular roof contours
+    # 4. Unmapped Buildings/Houses: roof-like rectangular contours on satellite.
+    #    Roads are deliberately NOT detected here — roads always come from
+    #    OSM Overpass vectors (see detect_objects). This stage only adds
+    #    structures missing from OSM, cross-checked by 18 m haversine.
     if "building" in wanted:
         gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        # Scale-adaptive contour area: target real houses ~20–3000 sqm.
+        # Fixed px limits (old 30–2500px) missed houses whenever m/px != ~1.
+        min_px = max(12.0, 20.0 / max(px_area_sqm, 1e-6))
+        max_px = min(float(H * W) * 0.05, 3000.0 / max(px_area_sqm, 1e-6))
+        if max_px < min_px + 5:
+            max_px = min_px + 5
         thresh = cv2.adaptiveThreshold(
-            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, -2
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 21, -4
+        )
+        thresh = cv2.morphologyEx(
+            thresh, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         )
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Largest-first + cap so dense urban tiles don't explode to 1000s of hits.
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:600]
         b_idx = 0
         existing = existing_building_coords or []
         for cnt in contours:
+            if b_idx >= 200:
+                break
             area = cv2.contourArea(cnt)
-            if 30 <= area <= 2500:
-                peri = cv2.arcLength(cnt, True)
-                approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
-                if 4 <= len(approx) <= 8:
-                    M = cv2.moments(cnt)
-                    if M["m00"] > 0:
-                        cx = M["m10"] / M["m00"]
-                        cy = M["m01"] / M["m00"]
-                        lat = bbox["north"] - (cy / H) * (bbox["north"] - bbox["south"])
-                        lon = bbox["west"] + (cx / W) * (bbox["east"] - bbox["west"])
-                        # Cross-check: is this structure already in OSM? (minimum 18m distance)
-                        too_close = False
-                        for e_lat, e_lon in existing:
-                            if _haversine_m(lat, lon, e_lat, e_lon) < 18.0:
-                                too_close = True
-                                break
-                        if not too_close:
-                            b_idx += 1
-                            detections.append(
-                                {
-                                    "id": f"building-opt-{b_idx}",
-                                    "type": "building",
-                                    "lat": round(lat, 5),
-                                    "lon": round(lon, 5),
-                                    "area_sqm": round(area * px_area_sqm, 1),
-                                    "confidence": 0.84,
-                                    "source": "OpenCV Optical Satellite AI (Unmapped in OSM)",
-                                }
-                            )
+            if not (min_px <= area <= max_px):
+                continue
+            peri = cv2.arcLength(cnt, True)
+            if peri <= 0:
+                continue
+            approx = cv2.approxPolyDP(cnt, 0.03 * peri, True)
+            if not (4 <= len(approx) <= 8):
+                continue
+            # Rectangularity / solidity gate: roofs fill most of bounding rect
+            # and are mostly convex. Kills vegetation speckle / road fragments.
+            x, y, w, h = cv2.boundingRect(approx)
+            if w <= 0 or h <= 0:
+                continue
+            rect_fill = area / float(w * h)
+            if not (0.45 <= rect_fill <= 1.0):
+                continue
+            hull_area = cv2.contourArea(cv2.convexHull(cnt))
+            if hull_area > 0 and (area / hull_area) < 0.80:
+                continue
+            aspect = max(w, h) / float(max(1, min(w, h)))
+            if aspect > 5.0:  # long thin sliver -> likely road / shadow, not house
+                continue
+            M = cv2.moments(cnt)
+            if M["m00"] <= 0:
+                continue
+            cx = M["m10"] / M["m00"]
+            cy = M["m01"] / M["m00"]
+            lat = bbox["north"] - (cy / H) * (bbox["north"] - bbox["south"])
+            lon = bbox["west"] + (cx / W) * (bbox["east"] - bbox["west"])
+            # Cross-check: is this structure already in OSM? (minimum 18m distance)
+            too_close = False
+            for e_lat, e_lon in existing:
+                if _haversine_m(lat, lon, e_lat, e_lon) < 18.0:
+                    too_close = True
+                    break
+            if not too_close:
+                b_idx += 1
+                detections.append(
+                    {
+                        "id": f"building-opt-{b_idx}",
+                        "type": "building",
+                        "lat": round(lat, 5),
+                        "lon": round(lon, 5),
+                        "area_sqm": round(area * px_area_sqm, 1),
+                        "confidence": 0.84,
+                        "source": "ArcGIS Optical Satellite AI (Unmapped in OSM)",
+                    }
+                )
+        logger.info(
+            f"[SatVision] optical buildings: {b_idx} unmapped "
+            f"(m/px={m_per_px_x:.2f}x{m_per_px_y:.2f}, px_range={min_px:.0f}-{max_px:.0f})"
+        )
 
     return detections
 
@@ -259,11 +314,15 @@ def detect_objects(
     object_types: List[str],
     model: str = "osm-vector",
 ) -> Dict[str, Any]:
-    """Derive object detections for a bbox via Hybrid Optical AI or OSM-vector baseline.
+    """Derive object detections for a bbox via Hybrid / MS-fast / OSM-only / optical.
 
-    - In 'osm-vector' mode: relies on OSM vectors; water/tree/solar reported in not_available_types.
-    - In 'hybrid' mode: fuses real-time optical satellite CV with OSM vector ground-truth.
-      Detects water, trees, solar, roads, buildings, AND catches unmapped structures from imagery!
+    Split (by design):
+    - buildings/houses: OSM vectors (mapped) + Microsoft GlobalML footprints
+      (fast precomputed DNN) + OpenCV optical (unmapped roofs) in hybrid;
+      MS + OSM in ms-footprints (fast, no image fetch).
+    - roads incl. main roads: OSM Overpass ONLY in every mode, never optical.
+    - water/tree/solar: OpenCV optical in hybrid/optical-satellite mode;
+      reported in not_available_types in osm-vector / ms-footprints mode.
     """
     requested = list(object_types or [])
     unknown = [t for t in requested if t not in ALLOWED_OBJECT_TYPES]
@@ -272,20 +331,34 @@ def detect_objects(
     wanted = set(requested)
 
     is_hybrid = model in ("hybrid", "optical-satellite")
-    not_available = [] if is_hybrid else [t for t in requested if t in VISION_ONLY_TYPES]
+    use_ms = model in ("hybrid", "ms-footprints")
+    use_optical = model in ("hybrid", "optical-satellite")
+    not_available = [] if use_optical else [t for t in requested if t in VISION_ONLY_TYPES]
 
     detections: List[Dict[str, Any]] = []
     is_synthetic = False
     existing_building_coords: List[tuple] = []
 
-    # 1. Fetch OSM Vector Data (unless pure optical-satellite mode)
+    # 1. Fetch OSM Vector Data (unless pure optical-satellite mode).
+    # MS-first: when houses are wanted and MS covers the bbox, skip the heavy
+    # Overpass buildings query — Overpass serves roads + facilities only.
+    ms_preloaded: Optional[Dict[str, Any]] = None
+    skip_osm_bld = False
+    if model != "optical-satellite" and "building" in wanted and use_ms:
+        try:
+            ms_preloaded = fetch_ms_buildings(bbox, limit=1000)
+            skip_osm_bld = len(ms_preloaded.get("buildings", []) or []) >= 20
+        except Exception as e:
+            logger.warning(f"[SatVision] MS probe failed, full OSM fetch: {e}")
+            ms_preloaded = None
     if model != "optical-satellite":
         try:
-            data = fetch_geodata(bbox["south"], bbox["west"], bbox["north"], bbox["east"])
+            data = fetch_geodata(bbox["south"], bbox["west"], bbox["north"], bbox["east"],
+                                 skip_osm_buildings=skip_osm_bld)
             is_synthetic = bool(data.get("is_synthetic", False))
 
             def _source_of(feat: Dict[str, Any]) -> str:
-                return "synthetic" if feat.get("source") == "synthetic" else "Overpass API (OpenStreetMap)"
+                return "synthetic" if feat.get("source") == "synthetic" else "OpenStreetMap"
 
             def _discount(conf: float, feat: Dict[str, Any]) -> float:
                 if feat.get("source") == "synthetic":
@@ -298,7 +371,10 @@ def detect_objects(
                     c_lat, c_lon = centroid.get("lat"), centroid.get("lon")
                     if c_lat is None or c_lon is None:
                         continue
-                    existing_building_coords.append((c_lat, c_lon))
+                    # Synthetic fallback points are fake — never let them veto
+                    # real optical/MS detections. Only real OSM suppresses.
+                    if b.get("source") != "synthetic":
+                        existing_building_coords.append((c_lat, c_lon))
                     has_attrs = bool(b.get("levels")) or bool(b.get("area_sqm"))
                     conf = 0.92 if has_attrs else 0.78
                     detections.append(
@@ -331,12 +407,30 @@ def detect_objects(
                     )
         except Exception as e:
             logger.warning(f"[SatVision] geodata fetch failed: {e}")
-            if not is_hybrid:
+            if not is_hybrid and not use_ms:
                 return _empty_result(is_synthetic=True, not_available=not_available)
             is_synthetic = True
 
+    # 1b. Microsoft GlobalML footprints — fast precomputed DNN buildings.
+    #     Skipped only in pure osm-vector / optical-satellite modes.
+    #     Reuses the MS-first probe (no double tile parse).
+    if use_ms and "building" in wanted:
+        try:
+            if ms_preloaded is not None:
+                ms = ms_preloaded
+                tiles_q, tiles_h = ms.get("tiles_queried", 0), ms.get("tiles_hit", 0)
+            else:
+                ms = fetch_ms_buildings(bbox)
+                tiles_q, tiles_h = ms.get("tiles_queried", 0), ms.get("tiles_hit", 0)
+            for b in ms.get("buildings", []) or []:
+                existing_building_coords.append((b["lat"], b["lon"]))
+                detections.append(b)
+            logger.info(f"[MS-Buildings] {len(ms.get('buildings', []) or [])} footprints from {tiles_h}/{tiles_q} tiles")
+        except Exception as e:
+            logger.warning(f"[SatVision] MS footprints fetch failed: {e}")
+
     # 2. Run Real-Time Optical Satellite AI Computer Vision in Hybrid Mode
-    if is_hybrid:
+    if use_optical:
         optical_wanted = set(wanted)
         if model == "hybrid":
             # In hybrid mode, we detect water, trees, solar, AND unmapped buildings from optical satellite

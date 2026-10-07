@@ -92,7 +92,8 @@ def test_detect_returns_stats(monkeypatch):
     import satvision
 
     monkeypatch.setattr(satvision, "fetch_geodata", lambda *a, **k: _canned_one_building_one_road())
-    res = client.post("/api/satvision/detect", json={"bbox": BBOX, "object_types": ["building", "road"]})
+    monkeypatch.setattr(satvision, "_fetch_arcgis_satellite_raster", lambda bbox: None)
+    res = client.post("/api/satvision/detect", json={"bbox": BBOX, "object_types": ["building", "road"], "model": "osm-vector"})
     assert res.status_code == 200
     data = res.json()
     _track(data["snapshot_id"])
@@ -122,9 +123,10 @@ def test_detect_vision_only_types_not_available(monkeypatch):
     import satvision
 
     monkeypatch.setattr(satvision, "fetch_geodata", lambda *a, **k: _canned_one_building_one_road())
+    monkeypatch.setattr(satvision, "_fetch_arcgis_satellite_raster", lambda bbox: None)
     res = client.post(
         "/api/satvision/detect",
-        json={"bbox": BBOX, "object_types": ["building", "water", "tree", "solar"]},
+        json={"bbox": BBOX, "object_types": ["building", "water", "tree", "solar"], "model": "osm-vector"},
     )
     assert res.status_code == 200
     data = res.json()
@@ -137,7 +139,8 @@ def test_compare_identical_snapshots_zero_changes(monkeypatch):
     import satvision
 
     monkeypatch.setattr(satvision, "fetch_geodata", lambda *a, **k: _canned_one_building_one_road())
-    res = client.post("/api/satvision/detect", json={"bbox": BBOX, "object_types": ["building"]})
+    monkeypatch.setattr(satvision, "_fetch_arcgis_satellite_raster", lambda bbox: None)
+    res = client.post("/api/satvision/detect", json={"bbox": BBOX, "object_types": ["building"], "model": "osm-vector"})
     assert res.status_code == 200
     sid = _track(res.json()["snapshot_id"])
     cmp_res = client.post("/api/satvision/compare", json={"snapshot_id_a": sid, "snapshot_id_b": sid})
@@ -153,12 +156,13 @@ def test_compare_added_removed_detected(monkeypatch):
     import satvision
 
     monkeypatch.setattr(satvision, "fetch_geodata", lambda *a, **k: _canned_one_building_one_road())
-    res_a = client.post("/api/satvision/detect", json={"bbox": BBOX, "object_types": ["building"]})
+    monkeypatch.setattr(satvision, "_fetch_arcgis_satellite_raster", lambda bbox: None)
+    res_a = client.post("/api/satvision/detect", json={"bbox": BBOX, "object_types": ["building"], "model": "osm-vector"})
     assert res_a.status_code == 200
     sid_a = _track(res_a.json()["snapshot_id"])
 
     monkeypatch.setattr(satvision, "fetch_geodata", lambda *a, **k: _canned_two_buildings())
-    res_b = client.post("/api/satvision/detect", json={"bbox": BBOX, "object_types": ["building"]})
+    res_b = client.post("/api/satvision/detect", json={"bbox": BBOX, "object_types": ["building"], "model": "osm-vector"})
     assert res_b.status_code == 200
     sid_b = _track(res_b.json()["snapshot_id"])
 
@@ -191,7 +195,8 @@ def test_empty_geodata_empty_detections(monkeypatch):
     monkeypatch.setattr(
         satvision, "fetch_geodata", lambda *a, **k: {"buildings": [], "roads": [], "is_synthetic": False}
     )
-    res = client.post("/api/satvision/detect", json={"bbox": BBOX, "object_types": ["building", "road"]})
+    monkeypatch.setattr(satvision, "_fetch_arcgis_satellite_raster", lambda bbox: None)
+    res = client.post("/api/satvision/detect", json={"bbox": BBOX, "object_types": ["building", "road"], "model": "osm-vector"})
     assert res.status_code == 200
     data = res.json()
     _track(data["snapshot_id"])
@@ -204,7 +209,8 @@ def test_snapshots_list_endpoint(monkeypatch):
     import satvision
 
     monkeypatch.setattr(satvision, "fetch_geodata", lambda *a, **k: _canned_one_building_one_road())
-    res = client.post("/api/satvision/detect", json={"bbox": BBOX, "object_types": ["building"]})
+    monkeypatch.setattr(satvision, "_fetch_arcgis_satellite_raster", lambda bbox: None)
+    res = client.post("/api/satvision/detect", json={"bbox": BBOX, "object_types": ["building"], "model": "osm-vector"})
     assert res.status_code == 200
     sid = _track(res.json()["snapshot_id"])
     listed = client.get("/api/satvision/snapshots")
@@ -213,11 +219,45 @@ def test_snapshots_list_endpoint(monkeypatch):
     assert sid in ids
 
 
+def test_detect_ms_footprints_fast(monkeypatch):
+    import satvision
+
+    monkeypatch.setattr(satvision, "fetch_geodata", lambda *a, **k: _canned_one_building_one_road())
+    monkeypatch.setattr(
+        satvision,
+        "fetch_ms_buildings",
+        lambda bbox, limit=1000: {"buildings": [
+            {"id": "ms-x-0", "type": "building", "lat": -32.05, "lon": 150.15,
+             "area_sqm": 150.0, "confidence": 0.94, "source": "Microsoft GlobalML"},
+        ], "tiles_queried": 1, "tiles_hit": 1},
+    )
+    res = client.post(
+        "/api/satvision/detect",
+        json={"bbox": BBOX, "object_types": ["building", "road"], "model": "ms-footprints"},
+    )
+    assert res.status_code == 200
+    data = res.json()
+    _track(data["snapshot_id"])
+    types = [d["type"] for d in data["detections"]]
+    assert "building" in types and "road" in types
+    ms = next(d for d in data["detections"] if d.get("source") == "Microsoft GlobalML")
+    assert ms["confidence"] == 0.94
+    # fast mode never fetches optical: vision types reported unavailable
+    res2 = client.post(
+        "/api/satvision/detect",
+        json={"bbox": BBOX, "object_types": ["water"], "model": "ms-footprints"},
+    )
+    assert res2.status_code == 200
+    assert res2.json()["not_available_types"] == ["water"]
+
+
 def test_detect_hybrid_optical_satellite(monkeypatch):
     import satvision
     import numpy as np
 
     monkeypatch.setattr(satvision, "fetch_geodata", lambda *a, **k: _canned_one_building_one_road())
+    monkeypatch.setattr(satvision, "fetch_ms_buildings",
+                        lambda bbox, limit=1000: {"buildings": [], "tiles_queried": 0, "tiles_hit": 0})
     # Mock synthetic optical satellite image with green vegetation and blue water
     fake_img = np.zeros((100, 100, 3), dtype=np.uint8)
     fake_img[10:30, 10:30] = [20, 180, 20]  # green vegetation

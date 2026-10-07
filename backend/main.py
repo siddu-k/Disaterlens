@@ -40,6 +40,7 @@ from db.spatial_store import (
     get_satvision_snapshot,
 )
 from satvision import detect_objects, compare_snapshots
+from ms_buildings import fuse_ms_into_geodata, fetch_ms_buildings as _ms_probe_fetch
 
 app = FastAPI(
     title="TerraLab API",
@@ -257,7 +258,7 @@ class SetAiKeyRequest(BaseModel):
 class SatvisionDetectRequest(BaseModel):
     bbox: BoundingBox
     object_types: List[str] = Field(default=["building", "road"])
-    model: Optional[str] = "osm-vector"
+    model: Optional[str] = "hybrid"
 
 
 class SatvisionCompareRequest(BaseModel):
@@ -295,10 +296,9 @@ class ResearchChatRequest(BaseModel):
 @app.get("/")
 async def root():
     return {
-        "service": "DisasterLens (TerraLab API)",
-        "status": "online",
-        "frontend_ui": "http://localhost:5173",
-        "api_docs": "/docs",
+        "service": "TerraLab API",
+        "version": "2.0.0",
+        "docs": "/docs",
         "health": "/api/health",
     }
 
@@ -527,7 +527,7 @@ def run_simulation_endpoint(request: SimulationRequest):
     """
     Run full end-to-end multi-hazard simulation pipeline:
     1. Retrieve DEM & Topography
-    2. Ingest OSM roads, buildings, facilities
+    2. Ingest OSM roads, buildings, facilities + fuse MS GlobalML houses
     3. Run scientific hazard engine (Flood, Quake, Wildfire, Landslide, Cyclone)
     4. Deterministic GIS Impact Intersection (InaSAFE concept)
     5. NetworkX graph safe evacuation routing
@@ -564,15 +564,41 @@ def run_simulation_endpoint(request: SimulationRequest):
         elevation = elev_result["elevation"]
         timing["elevation_time_s"] = round(time.time() - t0, 2)
 
-        # Step 2: Ingest OSM geodata
+        # Step 2: Ingest OSM geodata (roads + facilities + mapped buildings)
+        # MS-first: probe Microsoft footprints; when MS covers houses (>=20),
+        # skip the heavy 60s Overpass buildings query so Overpass only serves
+        # roads + facilities (hospitals/schools/...). MS fills houses in 2b.
         t0 = time.time()
+        ms_probe: Optional[Dict[str, Any]] = None
+        skip_osm_bld = False
+        try:
+            ms_probe = _ms_probe_fetch(sim_bbox, limit=2500)
+            skip_osm_bld = len(ms_probe.get("buildings", []) or []) >= 20
+            if skip_osm_bld:
+                logger.info(f"[MS-Probe] {len(ms_probe['buildings'])} MS houses — skipping OSM buildings query")
+        except Exception as e:
+            logger.warning(f"[MS-Probe] failed, full OSM fetch: {e}")
+            ms_probe = None
         geodata = fetch_geodata(
             sim_bbox["south"],
             sim_bbox["west"],
             sim_bbox["north"],
             sim_bbox["east"],
+            skip_osm_buildings=skip_osm_bld,
         )
         timing["geodata_time_s"] = round(time.time() - t0, 2)
+
+        # Step 2b: Fuse Microsoft GlobalML houses (best-effort, never fatal).
+        # Role split: OSM owns roads + facilities (hospitals/schools/...) +
+        # mapped buildings; MS adds ONLY unmapped houses (>=18m from any real
+        # OSM centroid) in OSM building shape so impact + map consume them as-is.
+        t0 = time.time()
+        try:
+            fuse_info = fuse_ms_into_geodata(geodata, sim_bbox, limit=2500, preloaded=ms_probe)
+            fuse_info["osm_buildings_skipped"] = bool(skip_osm_bld)
+        except Exception as e:
+            logger.warning(f"[MS-Fusion] skipped: {e}")
+        timing["ms_fusion_time_s"] = round(time.time() - t0, 2)
 
         # Step 3: Run Disaster Model with AOI & Extended Domain Topography
         t0 = time.time()
@@ -740,6 +766,8 @@ def run_simulation_endpoint(request: SimulationRequest):
                 "grid": elevation.tolist(),
                 "resolution_m": elev_result.get("resolution_m", 30.0),
                 "dataset": "Copernicus GLO-30 DEM",
+                "is_synthetic": bool(elev_synth),
+                "source": elev_result.get("source") or ("Modeled fallback terrain (offline)" if elev_synth else "Copernicus GLO-30 DEM via Open-Meteo"),
                 "vertical_datum": "EGM96 (Earth Gravitational Model 1996)",
                 "accuracy_m": "< 4.0m LE90",
             },
@@ -749,6 +777,7 @@ def run_simulation_endpoint(request: SimulationRequest):
             "timing": timing,
             "scenario": scenario_params,
             "provenance": get_provenance_summary(disaster_type),
+            "ms_fused": geodata.get("ms_fused", {}),
         }
 
     except HTTPException:
@@ -913,7 +942,7 @@ def satvision_detect_endpoint(request: SatvisionDetectRequest):
         result = detect_objects(
             request.bbox.model_dump(),
             request.object_types,
-            model=request.model or "osm-vector",
+            model=request.model or "hybrid",
         )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))

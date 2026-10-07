@@ -158,31 +158,24 @@ export default function SatMiniMap({
 
     (detections || []).slice(0, 1000).forEach((d) => {
       if (typeof d.lat !== 'number' || typeof d.lon !== 'number') return;
-      const isOpenCv = (d.source && (d.source.toLowerCase().includes('opencv') || d.source.toLowerCase().includes('optical'))) || String(d.id).includes('opt');
-      const isHouse = d.type === 'building';
-      const color = isHouse && isOpenCv ? '#f59e0b' : (TYPE_COLORS[d.type] || '#94a3b8');
-
-      const sourceBadge = isOpenCv
-        ? `<div style="margin-top:3px;"><span style="display:inline-block;padding:2px 7px;border-radius:4px;font-size:9.5px;font-weight:700;background:rgba(245,158,11,0.22);color:#fbbf24;border:1px solid rgba(245,158,11,0.45);font-family:monospace;">Mapped by: OpenCV (Satellite AI)</span></div>`
-        : `<div style="margin-top:3px;"><span style="display:inline-block;padding:2px 7px;border-radius:4px;font-size:9.5px;font-weight:700;background:rgba(59,130,246,0.22);color:#60a5fa;border:1px solid rgba(59,130,246,0.45);font-family:monospace;">Mapped by: Overpass API (OSM)</span></div>`;
-
-      const typeLabel = isHouse
-        ? (isOpenCv ? 'House (Discovered by OpenCV)' : 'House / Building (OSM)')
-        : d.type;
-
+      const color = TYPE_COLORS[d.type] || '#94a3b8';
+      const src = String((d as { source?: unknown }).source ?? '');
+      const by = /microsoft/i.test(src) ? '<br/><span style="color:#a78bfa;font-weight:700;">⚡ Microsoft GlobalML</span>'
+        : /unmapped/i.test(src) ? '<br/><span style="color:#38bdf8;font-weight:700;">✦ OpenCV (unmapped)</span>'
+        : /optical|arcgis/i.test(src) ? '<br/><span style="color:#38bdf8;font-weight:700;">✦ OpenCV Satellite AI</span>'
+        : /synthetic/i.test(src) ? '<br/><span style="color:#94a3b8;">synthetic</span>'
+        : '<br/><span style="color:#34d399;font-weight:700;">⬢ Overpass (OSM)</span>';
       L.circleMarker([d.lat, d.lon], {
-        radius: isHouse && isOpenCv ? 5.5 : 4,
-        color: isHouse && isOpenCv ? '#fbbf24' : color,
-        weight: isHouse && isOpenCv ? 2.0 : 1.5,
+        radius: 4,
+        color,
+        weight: 1.5,
         fillColor: color,
         fillOpacity: 0.85 * detOpacity + 0.15,
         opacity: detOpacity,
       })
         .addTo(detRef.current!)
         .bindTooltip(
-          `<b>${typeLabel}</b>
-           ${sourceBadge}
-           <div style="font-size:10px;color:#94a3b8;margin-top:2px;">${d.confidence != null ? `Conf: ${Math.round(d.confidence * 100)}%` : ''}${d.area_sqm != null ? ` • Area: ${Math.round(d.area_sqm)} m²` : ''}</div>`,
+          `<b>${d.type}</b>${d.confidence != null ? ` • ${Math.round(d.confidence * 100)}%` : ''}${d.area_sqm != null ? `<br/>${Math.round(d.area_sqm)} m²` : ''}${by}`,
           { direction: 'top', className: 'custom-map-tooltip' }
         );
     });

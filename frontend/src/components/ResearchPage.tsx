@@ -416,15 +416,8 @@ export default function ResearchPage({ onBack, onSendToSimulation }: ResearchPag
             fillOpacity: 0.7,
             weight: 1.5,
           });
-          const isOpenCv = (d.source && (d.source.toLowerCase().includes('opencv') || d.source.toLowerCase().includes('optical'))) || String(d.id).includes('opt');
-          const sourceBadge = isOpenCv
-            ? `<div style="margin-top:3px;"><span style="display:inline-block;padding:2px 7px;border-radius:4px;font-size:9.5px;font-weight:700;background:rgba(245,158,11,0.22);color:#fbbf24;border:1px solid rgba(245,158,11,0.45);font-family:monospace;">Mapped by: OpenCV (Satellite AI)</span></div>`
-            : `<div style="margin-top:3px;"><span style="display:inline-block;padding:2px 7px;border-radius:4px;font-size:9.5px;font-weight:700;background:rgba(59,130,246,0.22);color:#60a5fa;border:1px solid rgba(59,130,246,0.45);font-family:monospace;">Mapped by: Overpass API (OSM)</span></div>`;
-
           marker.bindTooltip(
-            `<strong style="color:${color};">${label}</strong>
-             ${sourceBadge}
-             <div style="font-size:10px; color:#94a3b8; margin-top:2px;">Conf: ${(d.confidence * 100).toFixed(0)}%${d.area_sqm != null ? ` • Area: ${Math.round(d.area_sqm)} m²` : ''}</div>`,
+            `<strong style="color:${color};">${label}</strong><br/><span style="font-size:10px; color:#94a3b8;">Conf: ${(d.confidence * 100).toFixed(0)}%</span>`,
             { className: 'research-map-tooltip' }
           );
           group.addLayer(marker);

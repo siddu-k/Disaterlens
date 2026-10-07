@@ -91,6 +91,8 @@ export interface BuildingFeature {
   amenity?: string;
   osm_type?: string;
   raw_tags?: Record<string, any>;
+  source?: string;
+  confidence?: number;
 }
 
 export interface Facility {
@@ -270,6 +272,8 @@ export interface SimulationResult {
     dataset?: string;
     vertical_datum?: string;
     accuracy_m?: string;
+    is_synthetic?: boolean;
+    source?: string;
   };
   bbox: BoundingBox;
   aoi_bbox?: BoundingBox;

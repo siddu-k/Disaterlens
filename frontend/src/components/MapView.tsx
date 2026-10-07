@@ -38,6 +38,25 @@ function isSafeHttpUrl(url: string): boolean {
   return url.startsWith('http://') || url.startsWith('https://');
 }
 
+// Mapped-by badge: who detected this house — OpenCV optical, Overpass OSM,
+// or Microsoft GlobalML. Shared by SatVision + simulation-building tooltips.
+function mappedByBadge(source: unknown): string {
+  const s = String(source ?? '');
+  if (/microsoft/i.test(s)) {
+    return '<span style="font-size:10px;font-weight:700;color:#a78bfa;">⚡ Mapped by Microsoft GlobalML</span>';
+  }
+  if (/unmapped/i.test(s)) {
+    return '<span style="font-size:10px;font-weight:700;color:#38bdf8;">✦ Mapped by OpenCV (unmapped in OSM)</span>';
+  }
+  if (/optical|arcgis/i.test(s)) {
+    return '<span style="font-size:10px;font-weight:700;color:#38bdf8;">✦ Mapped by OpenCV Satellite AI</span>';
+  }
+  if (/synthetic/i.test(s)) {
+    return '<span style="font-size:10px;color:#94a3b8;">Mapped by synthetic fallback</span>';
+  }
+  return '<span style="font-size:10px;font-weight:700;color:#34d399;">⬢ Mapped by Overpass (OSM)</span>';
+}
+
 // Per-hazard display vocabulary: per-frame marker thresholds, status words, units.
 // Frame thresholds mirror backend analysis/impact.py building bands.
 function hazardDisplay(disasterType?: string) {
@@ -736,31 +755,18 @@ export default function MapView({
 
     (satDetections || []).slice(0, 1000).forEach((d) => {
       if (typeof d.lat !== 'number' || typeof d.lon !== 'number') return;
-      const isOpenCv = (d.source && (d.source.toLowerCase().includes('opencv') || d.source.toLowerCase().includes('optical'))) || String(d.id).includes('opt');
-      const isHouse = d.type === 'building';
-      const color = isHouse && isOpenCv ? '#f59e0b' : detColor(String(d.type));
-
-      const sourceBadge = isOpenCv
-        ? `<div style="margin-top:3px;margin-bottom:2px;"><span style="display:inline-block;padding:2px 7px;border-radius:4px;font-size:9.5px;font-weight:700;background:rgba(245,158,11,0.22);color:#fbbf24;border:1px solid rgba(245,158,11,0.45);font-family:monospace;">Mapped by: OpenCV (Satellite AI)</span></div>`
-        : `<div style="margin-top:3px;margin-bottom:2px;"><span style="display:inline-block;padding:2px 7px;border-radius:4px;font-size:9.5px;font-weight:700;background:rgba(59,130,246,0.22);color:#60a5fa;border:1px solid rgba(59,130,246,0.45);font-family:monospace;">Mapped by: Overpass API (OSM)</span></div>`;
-
-      const typeLabel = isHouse 
-        ? (isOpenCv ? 'House (Discovered by OpenCV)' : 'House / Building (OSM)')
-        : String(d.type);
-
+      const color = detColor(String(d.type));
       L.circleMarker([d.lat, d.lon], {
-        radius: isHouse && isOpenCv ? 5.5 : 4,
-        color: isHouse && isOpenCv ? '#fbbf24' : color,
+        radius: 4,
+        color,
         fillColor: color,
         fillOpacity: Math.max(0.15, 0.85 * detOpacity),
         opacity: Math.max(0.15, detOpacity),
-        weight: isHouse && isOpenCv ? 2.0 : 1.2,
+        weight: 1.2,
       })
         .addTo(satDetectionsLayerRef.current!)
         .bindTooltip(
-          `<strong>${escapeHtml(typeLabel)}</strong>
-           ${sourceBadge}
-           <div style="font-size:10px;color:#94a3b8;margin-top:2px;">Confidence: ${(Number(d.confidence) * 100).toFixed(0)}%${d.area_sqm != null ? ` • Area: ${Math.round(Number(d.area_sqm))} m²` : ''}</div>`,
+          `<strong>${escapeHtml(String(d.type))}</strong><br/><span style="font-size:10px;color:#94a3b8;">conf ${(Number(d.confidence) * 100).toFixed(0)}%${d.area_sqm != null ? ` • ${Math.round(Number(d.area_sqm))} m²` : ''}</span><br/>${mappedByBadge((d as { source?: unknown }).source)}`,
           { sticky: true, className: 'custom-map-tooltip' }
         );
     });
@@ -805,11 +811,8 @@ export default function MapView({
         dashArray: '5, 5',
         fillColor: '#38bdf8',
         fillOpacity: 0.02,
+        interactive: false,
       }).addTo(mapRef.current);
-      bboxRectRef.current.bindTooltip(
-        '<strong>Selected Area of Interest (AOI)</strong><br/><span style="color:#94a3b8;font-size:10px;">Downhill stormwater runoff is physically simulated across the boundary into lower exterior areas.</span>',
-        { sticky: true, className: 'custom-map-tooltip' }
-      );
     }
     mapRef.current.fitBounds(bounds, { padding: [40, 40] });
 
@@ -1063,10 +1066,9 @@ export default function MapView({
       marker.addTo(buildingsLayerRef.current!);
 
       marker.bindTooltip(
-        `<strong>${escapeHtml(bldg.name || `House / Structure #${bldg.id}`)}</strong>
-         <div style="margin:3px 0;"><span style="display:inline-block;padding:2px 7px;border-radius:4px;font-size:9.5px;font-weight:700;background:rgba(59,130,246,0.22);color:#60a5fa;border:1px solid rgba(59,130,246,0.45);font-family:monospace;letter-spacing:0.3px;">Mapped by: Overpass API (OSM)</span></div>
+        `<strong>${escapeHtml(bldg.name || `OSM Structure #${bldg.id}`)}</strong><br/>
          <span style="color:${isAffected ? '#f87171' : '#38bdf8'};font-weight:700;">${isAffected ? `${escapeHtml(bldg.damage_state && !['None', 'Unaffected'].includes(bldg.damage_state) ? bldg.damage_state.toUpperCase() : hz.affectedWord)} (${(bldg.hazard_severity ?? depth).toFixed(2)} ${hz.unit})` : hz.clearWord}</span><br/>
-         Type: <code>${escapeHtml(symbolInfo ? symbolInfo.label : (bldg.type || 'House / Structure'))}</code> • Area: ${bldg.area_sqm} m² ${bldg.levels ? `• ${bldg.levels} Fl` : ''}`,
+         Type: <code>${escapeHtml(symbolInfo ? symbolInfo.label : (bldg.type || 'General Structure'))}</code> • Area: ${bldg.area_sqm} m² ${bldg.levels ? `• ${bldg.levels} Fl` : ''}<br/>${mappedByBadge((bldg as { source?: unknown }).source)}`,
         { sticky: true, className: 'custom-map-tooltip' }
       );
 
@@ -2078,7 +2080,16 @@ export default function MapView({
             <div>
               <div className="osm-inspector-modal__title"><IconBuilding size={15} className="svg-icon-inline" /> {selectedBuilding.name}</div>
               <div className="osm-inspector-modal__subtitle">
-                OSM Structure #{selectedBuilding.id} • {selectedBuilding.type.toUpperCase()}
+                {String(selectedBuilding.source || '').toLowerCase().includes('microsoft') ? `MS House ${selectedBuilding.id}` : `OSM Structure #${selectedBuilding.id}`} • {selectedBuilding.type.toUpperCase()}
+              </div>
+              <div style={{ marginTop: 4, fontSize: 11 }}>
+                {String(selectedBuilding.source || '').toLowerCase().includes('microsoft') ? (
+                  <span style={{ fontWeight: 700, color: '#a78bfa' }}>⚡ Mapped by Microsoft GlobalML</span>
+                ) : String(selectedBuilding.source || '').toLowerCase().includes('synthetic') ? (
+                  <span style={{ color: '#94a3b8' }}>Mapped by synthetic fallback</span>
+                ) : (
+                  <span style={{ fontWeight: 700, color: '#34d399' }}>⬢ Mapped by Overpass (OSM)</span>
+                )}
               </div>
               <span className={`road-status-badge ${selectedBuilding.flooded ? 'road-status-badge--closed' : 'road-status-badge--open'}`}>
                 {selectedBuilding.flooded ? `${selectedBuilding.damage_state && !['None', 'Unaffected'].includes(selectedBuilding.damage_state) ? selectedBuilding.damage_state.toUpperCase() : hz.affectedWord} (${(selectedBuilding.hazard_severity ?? selectedBuilding.flood_depth).toFixed(2)} ${hz.unit})` : hz.clearWord}
@@ -2129,14 +2140,16 @@ export default function MapView({
               <span className="osm-inspector-modal__val">{selectedBuilding.type}</span>
             </div>
 
-            <a
-              className="osm-link-btn"
-              href={`https://www.openstreetmap.org/way/${selectedBuilding.id}`}
-              target="_blank"
-              rel="noopener noreferrer"
-            >
-              Open in OpenStreetMap ↗
-            </a>
+            {!String(selectedBuilding.source || '').toLowerCase().includes('microsoft') && (
+              <a
+                className="osm-link-btn"
+                href={`https://www.openstreetmap.org/way/${selectedBuilding.id}`}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                Open in OpenStreetMap ↗
+              </a>
+            )}
 
             <RawTagsViewer tags={selectedBuilding.raw_tags} />
           </div>

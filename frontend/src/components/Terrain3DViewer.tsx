@@ -15,6 +15,8 @@ import {
   IconCyclone,
   IconMountain,
   IconEarthquake,
+  IconEye,
+  IconEyeOff,
 } from './Icons';
 
 interface Terrain3DViewerProps {
@@ -91,6 +93,26 @@ function getNormHazard(disaster: string, val: number, peak: number): number {
     return Math.min(1.0, Math.max(0, val / Math.max(0.15, peak)));
   }
   return Math.min(1.0, Math.max(0, val / Math.max(0.5, peak)));
+}
+
+// Bilinear sample of any coarse grid at normalized (u, v) in [0, 1].
+// Used so the fine render mesh and hazard overlays interpolate real data
+// instead of snapping to nearest coarse cells.
+function sampleGridBilinear(grid: number[][], u: number, v: number, fallback = 0): number {
+  const R = grid.length;
+  const C = grid[0]?.length || 0;
+  if (R === 0 || C === 0) return fallback;
+  const gr = Math.min(R - 1, Math.max(0, v * (R - 1)));
+  const gc = Math.min(C - 1, Math.max(0, u * (C - 1)));
+  const r0 = Math.min(R - 2, Math.floor(gr));
+  const c0 = Math.min(C - 2, Math.floor(gc));
+  const fr = gr - r0;
+  const fc = gc - c0;
+  const a = grid[r0]?.[c0] ?? fallback;
+  const b = grid[r0]?.[c0 + 1] ?? a;
+  const d = grid[r0 + 1]?.[c0] ?? a;
+  const e = grid[r0 + 1]?.[c0 + 1] ?? a;
+  return a * (1 - fr) * (1 - fc) + b * fr * (1 - fc) + d * (1 - fr) * fc + e * fr * fc;
 }
 
 // ─── 3D Tile Hit-Testing & Canvas Affine Texture Mapping ───
@@ -590,8 +612,11 @@ export default function Terrain3DViewer({
   const [localSpeed, setLocalSpeed] = useState<number>(playSpeed ?? 1);
   const [physicsEnabled, setPhysicsEnabled] = useState<boolean>(true);
   const [wavePhase, setWavePhase] = useState<number>(0);
-  const [tileNumberMode, setTileNumberMode] = useState<'id' | 'elev' | 'hazard' | 'off'>('id');
+  const [tileNumberMode, setTileNumberMode] = useState<'id' | 'elev' | 'hazard' | 'off'>('off');
   const [showBuildings, setShowBuildings] = useState<boolean>(true);
+  // Real-look satellite skin on the 3D mesh (actual AOI photo per quad).
+  // Off = classic elevation-band colors.
+  const [showSatelliteTexture, setShowSatelliteTexture] = useState<boolean>(true);
 
   // ─── 3D Selected Tile & Floating Satellite Hover State ───
   const [selectedTile, setSelectedTile] = useState<{ r: number; c: number } | null>(null);
@@ -618,6 +643,9 @@ export default function Terrain3DViewer({
   animFrameRef.current = animFrame;
   const isPlayingRef = useRef<boolean>(localPlaying);
   isPlayingRef.current = localPlaying;
+
+  const physicsRef = useRef<boolean>(physicsEnabled);
+  physicsRef.current = physicsEnabled;
   const speedRef = useRef<number>(localSpeed);
   speedRef.current = localSpeed;
   const lastTimeRef = useRef<number>(performance.now());
@@ -679,8 +707,13 @@ export default function Terrain3DViewer({
       const dt = Math.min(0.08, (now - lastTimeRef.current) / 1000);
       lastTimeRef.current = now;
 
-      // Real physical progression of wave/flicker/wind phase
-      setWavePhase((p) => (p + dt * 3.2) % (Math.PI * 200));
+      // Idle GPUs rest: when timeline is paused AND physics FX are off,
+      // nothing on screen moves — skip phase updates so React never re-renders.
+      const animating = isPlayingRef.current || physicsRef.current;
+      if (animating) {
+        // Real physical progression of wave/flicker/wind phase
+        setWavePhase((p) => (p + dt * 3.2) % (Math.PI * 200));
+      }
 
       if (isPlayingRef.current) {
         const total = Math.max(1, totalFrames - 1);
@@ -806,6 +839,41 @@ export default function Terrain3DViewer({
     return grid;
   }, [elev, rows, cols, minElev, maxElev]);
 
+  // Bilinear-upsampled render mesh (2× per DEM cell): every fine vertex is
+  // exact bilinear interpolation of real DEM samples — smooth terrain with
+  // zero invented detail, so ridges/valleys sit where the DEM says they are.
+  // SUB=2 (not 3) keeps weak laptops fluid: ~1.2k quads instead of ~2.7k.
+  const MESH_SUB = 2;
+  const fineMesh = useMemo(() => {
+    const R = elevGrid.length;
+    const C = elevGrid[0]?.length || 0;
+    if (R < 2 || C < 2) return { grid: elevGrid, rows: R, cols: C };
+    const FR = (R - 1) * MESH_SUB + 1;
+    const FC = (C - 1) * MESH_SUB + 1;
+    const fg: number[][] = [];
+    for (let r = 0; r < FR; r++) {
+      const gr = r / MESH_SUB;
+      const r0 = Math.min(R - 2, Math.floor(gr));
+      const fr = gr - r0;
+      const row: number[] = [];
+      for (let c = 0; c < FC; c++) {
+        const gc = c / MESH_SUB;
+        const c0 = Math.min(C - 2, Math.floor(gc));
+        const fc = gc - c0;
+        const a = elevGrid[r0][c0];
+        const b = elevGrid[r0][c0 + 1];
+        const d = elevGrid[r0 + 1][c0];
+        const e = elevGrid[r0 + 1][c0 + 1];
+        row.push(a * (1 - fr) * (1 - fc) + b * fr * (1 - fc) + d * (1 - fr) * fc + e * fr * fc);
+      }
+      fg.push(row);
+    }
+    return { grid: fg, rows: FR, cols: FC };
+  }, [elevGrid]);
+  const MROWS = fineMesh.rows;
+  const MCOLS = fineMesh.cols;
+  const fineElev = fineMesh.grid;
+
   // Continuous cubic-interpolated physical hazard grid at the exact sub-frame timestamp
   const { currentHazardGrid, nextHazardGrid, subFraction } = useMemo(() => {
     if (frames.length === 0) return { currentHazardGrid: [], nextHazardGrid: [], subFraction: 0 };
@@ -821,8 +889,10 @@ export default function Terrain3DViewer({
     };
   }, [frames, totalFrames, animFrame]);
 
-  // Preload full AOI satellite image once (guaranteed valid bbox, zero 500 errors)
-  const aoiBox = result.aoi_bbox || result.bbox;
+  // Satellite photo MUST cover result.bbox (the buffered sim domain the mesh,
+  // roads, buildings and hazard grids all live in). Fetching aoi_bbox instead
+  // stretches a smaller photo over the bigger mesh — roads/texture misalign.
+  const aoiBox = result.bbox;
   const aoiSatUrl = useMemo(() => {
     return `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/export?bbox=${aoiBox.west},${aoiBox.south},${aoiBox.east},${aoiBox.north}&bboxSR=4326&size=800,800&imageSR=4326&format=jpg&f=image`;
   }, [aoiBox.west, aoiBox.south, aoiBox.east, aoiBox.north]);
@@ -846,11 +916,11 @@ export default function Terrain3DViewer({
   const selectedTileData = useMemo(() => {
     if (!selectedTile) return null;
     const { r, c } = selectedTile;
-    if (r < 0 || r >= rows - 1 || c < 0 || c >= cols - 1) return null;
-    const u0 = c / Math.max(1, cols - 1);
-    const u1 = (c + 1) / Math.max(1, cols - 1);
-    const v0 = r / Math.max(1, rows - 1);
-    const v1 = (r + 1) / Math.max(1, rows - 1);
+    if (r < 0 || r >= MROWS - 1 || c < 0 || c >= MCOLS - 1) return null;
+    const u0 = c / Math.max(1, MCOLS - 1);
+    const u1 = (c + 1) / Math.max(1, MCOLS - 1);
+    const v0 = r / Math.max(1, MROWS - 1);
+    const v1 = (r + 1) / Math.max(1, MROWS - 1);
     const b = result.bbox;
     const tileWest = b.west + u0 * (b.east - b.west);
     const tileEast = b.west + u1 * (b.east - b.west);
@@ -862,18 +932,20 @@ export default function Terrain3DViewer({
     const tileHeightKm = (tileNorth - tileSouth) * 111.32;
     const tileWidthKm = (tileEast - tileWest) * 111.32 * Math.cos((tileLat * Math.PI) / 180);
 
-    const e00 = elevGrid[r]?.[c] ?? minElev;
-    const e10 = elevGrid[r]?.[c + 1] ?? minElev;
-    const e11 = elevGrid[r + 1]?.[c + 1] ?? minElev;
-    const e01 = elevGrid[r + 1]?.[c] ?? minElev;
+    const e00 = fineElev[r]?.[c] ?? minElev;
+    const e10 = fineElev[r]?.[c + 1] ?? minElev;
+    const e11 = fineElev[r + 1]?.[c + 1] ?? minElev;
+    const e01 = fineElev[r + 1]?.[c] ?? minElev;
     const avgElev = (e00 + e10 + e11 + e01) / 4;
 
-    const wA = currentHazardGrid[r]?.[c] ?? 0;
-    const wB = nextHazardGrid[r]?.[c] ?? wA;
+    const uMidT = (u0 + u1) / 2;
+    const vMidT = (v0 + v1) / 2;
+    const wA = sampleGridBilinear(currentHazardGrid, uMidT, vMidT, 0);
+    const wB = sampleGridBilinear(nextHazardGrid, uMidT, vMidT, wA);
     const avgHazard = wA + (wB - wA) * subFraction;
     const normH = getNormHazard(hazardType, avgHazard, peakVal);
 
-    const tileId = r * (cols - 1) + c + 1;
+    const tileId = r * (MCOLS - 1) + c + 1;
 
     return {
       r,
@@ -891,7 +963,7 @@ export default function Terrain3DViewer({
       avgHazard,
       normH,
     };
-  }, [selectedTile, cols, rows, result.bbox, elevGrid, minElev, currentHazardGrid, nextHazardGrid, subFraction, hazardType, peakVal]);
+  }, [selectedTile, MCOLS, MROWS, result.bbox, fineElev, minElev, currentHazardGrid, nextHazardGrid, subFraction, hazardType, peakVal]);
 
   // Render 3D Canvas Engine with Hazard-Specific Real-Time Physics & Animation
   useEffect(() => {
@@ -900,8 +972,9 @@ export default function Terrain3DViewer({
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    // Set high-DPI canvas
-    const dpr = window.devicePixelRatio || 1;
+    // Set high-DPI canvas (capped at 1.5×: full retina 2-3× quadruples
+    // fragment work and stalls weak GPUs for zero visible gain on a map mesh)
+    const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
     const width = canvas.clientWidth;
     const height = canvas.clientHeight;
     if (width <= 0 || height <= 0) return;
@@ -994,17 +1067,18 @@ export default function Terrain3DViewer({
     const wfDownwindV = -Math.cos(wfDirRad);
     const wfLeanMagnitude = Math.min(0.045, 0.012 + (wfWindSpeed / 100) * 0.035);
 
-    // Build mesh quads with depth sorting for correct 3D occlusion
+    // Build mesh quads with depth sorting for correct 3D occlusion.
+    // Fine mesh (3× bilinear upsample of real DEM cells) — smooth, accurate relief.
     const quads: Array<{ r: number; c: number; depth: number }> = [];
-    for (let r = 0; r < rows - 1; r++) {
-      for (let c = 0; c < cols - 1; c++) {
-        const uMid = (c + 0.5) / (cols - 1);
-        const vMid = (r + 0.5) / (rows - 1);
+    for (let r = 0; r < MROWS - 1; r++) {
+      for (let c = 0; c < MCOLS - 1; c++) {
+        const uMid = (c + 0.5) / (MCOLS - 1);
+        const vMid = (r + 0.5) / (MROWS - 1);
         const eMid = (
-          (elevGrid[r]?.[c] ?? minElev) +
-          (elevGrid[r]?.[c + 1] ?? minElev) +
-          (elevGrid[r + 1]?.[c + 1] ?? minElev) +
-          (elevGrid[r + 1]?.[c] ?? minElev)
+          (fineElev[r]?.[c] ?? minElev) +
+          (fineElev[r]?.[c + 1] ?? minElev) +
+          (fineElev[r + 1]?.[c + 1] ?? minElev) +
+          (fineElev[r + 1]?.[c] ?? minElev)
         ) / 4;
         const pt = project(uMid, vMid, eMid);
         quads.push({ r, c, depth: pt.depth });
@@ -1016,14 +1090,14 @@ export default function Terrain3DViewer({
 
     // Cache projected quad corners for mouse hit-testing (front-to-back order)
     screenQuadsRef.current = quads.slice().reverse().map(({ r, c, depth }) => {
-      const u0 = c / (cols - 1);
-      const u1 = (c + 1) / (cols - 1);
-      const v0 = r / (rows - 1);
-      const v1 = (r + 1) / (rows - 1);
-      const e00 = elevGrid[r]?.[c] ?? minElev;
-      const e10 = elevGrid[r]?.[c + 1] ?? minElev;
-      const e11 = elevGrid[r + 1]?.[c + 1] ?? minElev;
-      const e01 = elevGrid[r + 1]?.[c] ?? minElev;
+      const u0 = c / (MCOLS - 1);
+      const u1 = (c + 1) / (MCOLS - 1);
+      const v0 = r / (MROWS - 1);
+      const v1 = (r + 1) / (MROWS - 1);
+      const e00 = fineElev[r]?.[c] ?? minElev;
+      const e10 = fineElev[r]?.[c + 1] ?? minElev;
+      const e11 = fineElev[r + 1]?.[c + 1] ?? minElev;
+      const e01 = fineElev[r + 1]?.[c] ?? minElev;
       return {
         r,
         c,
@@ -1058,35 +1132,46 @@ export default function Terrain3DViewer({
       return wave * norm * 3.5;
     };
 
+    // Satellite skin available? (actual ArcGIS AOI photo mapped per-quad)
+    const satTexOn = showSatelliteTexture && !!aoiSatImg && aoiSatImg.complete && (aoiSatImg.naturalWidth || 0) > 0;
+
+    // Real meters per fine-mesh cell (for true-gradient hillshading).    // v grows southward, so +gy = ground falling toward the south.
+    const _bb = result.bbox;
+    const _midLat = (_bb.north + _bb.south) / 2;
+    const _mPerDegLon = 111320 * Math.cos((_midLat * Math.PI) / 180);
+    const _mPerCellX = Math.max(1, ((_bb.east - _bb.west) * _mPerDegLon) / Math.max(1, MCOLS - 1));
+    const _mPerCellY = Math.max(1, ((_bb.north - _bb.south) * 111320) / Math.max(1, MROWS - 1));
+
     // ─── Render 3D Quads (Back-to-Front) ───
     quads.forEach(({ r, c }) => {
-      const u0 = c / (cols - 1);
-      const u1 = (c + 1) / (cols - 1);
-      const v0 = r / (rows - 1);
-      const v1 = (r + 1) / (rows - 1);
+      const u0 = c / (MCOLS - 1);
+      const u1 = (c + 1) / (MCOLS - 1);
+      const v0 = r / (MROWS - 1);
+      const v1 = (r + 1) / (MROWS - 1);
       const uMid = (u0 + u1) / 2;
       const vMid = (v0 + v1) / 2;
 
-      const e00 = elevGrid[r]?.[c] ?? minElev;
-      const e10 = elevGrid[r]?.[c + 1] ?? minElev;
-      const e11 = elevGrid[r + 1]?.[c + 1] ?? minElev;
-      const e01 = elevGrid[r + 1]?.[c] ?? minElev;
+      const e00 = fineElev[r]?.[c] ?? minElev;
+      const e10 = fineElev[r]?.[c + 1] ?? minElev;
+      const e11 = fineElev[r + 1]?.[c + 1] ?? minElev;
+      const e01 = fineElev[r + 1]?.[c] ?? minElev;
 
-      // Real-time sub-frame hazard values for each vertex
-      const w00A = currentHazardGrid[r]?.[c] ?? 0;
-      const w00B = nextHazardGrid[r]?.[c] ?? w00A;
+      // Hazard values bilinearly interpolated at the exact vertex positions
+      // (coarse physics grid → smooth overlay, no block snapping).
+      const w00A = sampleGridBilinear(currentHazardGrid, u0, v0, 0);
+      const w00B = sampleGridBilinear(nextHazardGrid, u0, v0, w00A);
       const w00 = w00A + (w00B - w00A) * subFraction;
 
-      const w10A = currentHazardGrid[r]?.[c + 1] ?? 0;
-      const w10B = nextHazardGrid[r]?.[c + 1] ?? w10A;
+      const w10A = sampleGridBilinear(currentHazardGrid, u1, v0, 0);
+      const w10B = sampleGridBilinear(nextHazardGrid, u1, v0, w10A);
       const w10 = w10A + (w10B - w10A) * subFraction;
 
-      const w11A = currentHazardGrid[r + 1]?.[c + 1] ?? 0;
-      const w11B = nextHazardGrid[r + 1]?.[c + 1] ?? w11A;
+      const w11A = sampleGridBilinear(currentHazardGrid, u1, v1, 0);
+      const w11B = sampleGridBilinear(nextHazardGrid, u1, v1, w11A);
       const w11 = w11A + (w11B - w11A) * subFraction;
 
-      const w01A = currentHazardGrid[r + 1]?.[c] ?? 0;
-      const w01B = nextHazardGrid[r + 1]?.[c] ?? w01A;
+      const w01A = sampleGridBilinear(currentHazardGrid, u0, v1, 0);
+      const w01B = sampleGridBilinear(nextHazardGrid, u0, v1, w01A);
       const w01 = w01A + (w01B - w01A) * subFraction;
 
       const avgHazard = (w00 + w10 + w11 + w01) / 4;
@@ -1104,10 +1189,24 @@ export default function Terrain3DViewer({
       const p11 = project(u1, v1, e11 + se11);
       const p01 = project(u0, v1, e01 + se01);
 
-      // Directional shading based on local slope
-      const dzX = (e10 - e00 + (e11 - e01)) * 0.5;
-      const dzY = (e01 - e00 + (e11 - e10)) * 0.5;
-      const slopeShade = Math.max(0.65, Math.min(1.35, 1.0 + (dzX * 0.04 - dzY * 0.03)));
+      // Viewport culling: skip quads fully offscreen (60px margin covers
+      // flames/surge rising above the face). Big win when zoomed/rotated.
+      if (
+        (p00.x < -60 && p10.x < -60 && p11.x < -60 && p01.x < -60) ||
+        (p00.x > width + 60 && p10.x > width + 60 && p11.x > width + 60 && p01.x > width + 60) ||
+        (p00.y < -60 && p10.y < -60 && p11.y < -60 && p01.y < -60) ||
+        (p00.y > height + 60 && p10.y > height + 60 && p11.y > height + 60 && p01.y > height + 60)
+      ) {
+        return;
+      }
+
+      // True-gradient hillshading (NW light): dimensionless rise/run from real
+      // meters-per-cell, so flat plains shade flat and real scarps shade hard.
+      // +gx (rising eastward = west-facing) and +gy (falling southward =
+      // north-facing) both face the NW light → brighter.
+      const gx = ((e10 + e11) - (e00 + e01)) * 0.5 / _mPerCellX;
+      const gy = ((e01 + e11) - (e00 + e10)) * 0.5 / _mPerCellY;
+      const slopeShade = Math.max(0.55, Math.min(1.45, 1.0 + gx * 1.2 + gy * 1.4));
 
       const avgElev = (e00 + e10 + e11 + e01) / 4;
 
@@ -1143,7 +1242,7 @@ export default function Terrain3DViewer({
         }
       }
 
-      // Draw Terrain Face
+      // Draw Terrain Face (base elevation color — satellite texture overlays next)
       ctx.beginPath();
       ctx.moveTo(p00.x, p00.y);
       ctx.lineTo(p10.x, p10.y);
@@ -1153,14 +1252,40 @@ export default function Terrain3DViewer({
       ctx.fillStyle = faceColor;
       ctx.fill();
 
+      // Real-look satellite skin: affine-map the actual ArcGIS AOI imagery
+      // onto this quad so streets/blocks/water look like themselves, not bands.
+      if (satTexOn) {
+        ctx.save();
+        ctx.globalAlpha = isHazardActive ? 0.55 : 0.9;
+        drawTexturedQuad(ctx, aoiSatImg as HTMLImageElement, p00, p10, p11, p01, u0, v0, u1, v1);
+        ctx.restore();
+        // Relief shading over the photo: darken shadow slopes, lift lit ones.
+        const shadeA = slopeShade < 1
+          ? `rgba(0,0,0,${((1 - slopeShade) * 0.55).toFixed(2)})`
+          : `rgba(255,255,255,${((slopeShade - 1) * 0.45).toFixed(2)})`;
+        ctx.beginPath();
+        ctx.moveTo(p00.x, p00.y);
+        ctx.lineTo(p10.x, p10.y);
+        ctx.lineTo(p11.x, p11.y);
+        ctx.lineTo(p01.x, p01.y);
+        ctx.closePath();
+        ctx.fillStyle = shadeA;
+        ctx.fill();
+      }
+
       ctx.strokeStyle = isHazardActive && hazardType === 'wildfire' ? 'rgba(234, 88, 12, 0.35)' : 'rgba(15, 23, 42, 0.4)';
-      ctx.lineWidth = 0.5;
-      ctx.stroke();
+      // Photo skin already defines edges — skip 1,200 extra strokes/frame.
+      if (!satTexOn) {
+        ctx.lineWidth = 0.5;
+        ctx.stroke();
+      }
 
       // ─── UNIQUE 3D HAZARD PHENOMENON IMPLEMENTATION ───
 
       // 1. WILDFIRE: Volumetric 3D Flame Spires, Charred Ash & Drifting Embers
-      if (hazardType === 'wildfire' && isHazardActive) {
+      // Dense fine meshes draw flames on alternating quads only (identical look, half cost).
+      const flameSkip = MROWS * MCOLS > 2000 && (r + c) % 2 !== 0;
+      if (hazardType === 'wildfire' && isHazardActive && !flameSkip) {
         // Glowing ember veins inside charred scar
         if (physicsEnabled) {
           const emberPulse = (Math.sin(wavePhase * 4.0 + uMid * 24.0 + vMid * 18.0) + 1) * 0.5;
@@ -1300,7 +1425,7 @@ export default function Terrain3DViewer({
       else if (hazardType === 'cyclone') {
         const meta = (result.simulation as any)?.metadata || {};
         const surgeGrid: number[][] | undefined = meta.surge_grid;
-        const cellSurge = surgeGrid?.[r]?.[c] ?? 0;
+        const cellSurge = surgeGrid ? sampleGridBilinear(surgeGrid, uMid, vMid, 0) : 0;
         const isLowElevation = avgElev <= minElev + elevSpan * 0.25;
 
         // Dynamic time-dependent storm surge factor from simulation timeline
@@ -1400,7 +1525,7 @@ export default function Terrain3DViewer({
       if (tileNumberMode !== 'off') {
         let label = '';
         if (tileNumberMode === 'id') {
-          label = `${r * (cols - 1) + c + 1}`;
+          label = `${r * (MCOLS - 1) + c + 1}`;
         } else if (tileNumberMode === 'elev') {
           label = `${Math.round(avgElev)}m`;
         } else if (tileNumberMode === 'hazard') {
@@ -1937,7 +2062,10 @@ export default function Terrain3DViewer({
 
       const buildings = result.impact?.buildings || result.geodata?.buildings || [];
 
-      buildings.forEach((bd: any) => {
+      // Perf: thousands of fused MS houses × 60fps stalls weak GPUs.
+      // Stride-sample quiet markers to ~600/frame; impacted ones always draw.
+      const bStride = Math.max(1, Math.ceil(buildings.length / 600));
+      buildings.forEach((bd: any, bIdx: number) => {
         const cent = bd.centroid;
         if (!cent || typeof cent.lat !== 'number' || typeof cent.lon !== 'number') return;
         const u = (cent.lon - b.west) / lonSpan;
@@ -1952,6 +2080,7 @@ export default function Terrain3DViewer({
         const cellH = wA + (wB - wA) * subFraction;
 
         const isImp = isCellHazardActive(hazardType, cellH, peakVal);
+        if (!isImp && bIdx % bStride !== 0) return;
         const normH = getNormHazard(hazardType, cellH, peakVal);
 
         // Dynamic seismic sway or aerodynamic displacement (lateral only; no height)
@@ -1985,6 +2114,7 @@ export default function Terrain3DViewer({
         // Flat surface marker: buildings sit on the terrain with no height
         // projection (meter-height columns exaggerated into sky spikes).
         const base = project(u + swayU, v + swayV, groundE);
+        if (base.x < -12 || base.x > width + 12 || base.y < -12 || base.y > height + 12) return;
         ctx.fillStyle = col;
         const half = isImp ? 3.5 : 2.5;
         ctx.fillRect(base.x - half, base.y - half, half * 2, half * 2);
@@ -2240,6 +2370,9 @@ export default function Terrain3DViewer({
     zoom,
     zExaggeration,
     elevGrid,
+    fineElev,
+    MROWS,
+    MCOLS,
     currentHazardGrid,
     nextHazardGrid,
     subFraction,
@@ -2260,6 +2393,7 @@ export default function Terrain3DViewer({
     renderNonce,
     aoiSatImg,
     showBuildings,
+    showSatelliteTexture,
   ]);
 
   // Non-passive wheel listener: smooth, responsive exponential zoom across all mouse/trackpad modes
@@ -2536,6 +2670,17 @@ export default function Terrain3DViewer({
       <div className={`terrain3d-container ${isFullscreen ? 'terrain3d-container--fullscreen' : ''}`}>
         {/* Header HUD */}
         <div className="terrain3d-header">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11 }}>
+            {result.elevation?.is_synthetic ? (
+              <span title="Offline modeled terrain — reconnect for surveyed DEM" style={{ fontWeight: 700, color: '#fbbf24', background: 'rgba(251,191,36,0.12)', border: '1px solid rgba(251,191,36,0.4)', borderRadius: 4, padding: '2px 6px' }}>
+                ⚠ Modeled terrain (offline fallback)
+              </span>
+            ) : (
+              <span title={result.elevation?.source || 'Surveyed DEM'} style={{ fontWeight: 600, color: '#34d399', background: 'rgba(52,211,153,0.10)', border: '1px solid rgba(52,211,153,0.35)', borderRadius: 4, padding: '2px 6px' }}>
+                ⬢ Surveyed DEM{result.elevation?.resolution_m ? ` • ${result.elevation.resolution_m}m` : ''} • {MROWS}×{MCOLS} mesh
+              </span>
+            )}
+          </div>
           <div className="terrain3d-actions" style={{ marginLeft: 'auto' }}>
             <button
               className="terrain3d-btn terrain3d-btn--reset"
@@ -2566,6 +2711,14 @@ export default function Terrain3DViewer({
             </button>
 
             <button
+              className={`terrain3d-btn terrain3d-btn--toggle ${showSatelliteTexture ? 'terrain3d-btn--active' : ''}`}
+              onClick={() => setShowSatelliteTexture((v) => !v)}
+              title={showSatelliteTexture ? 'Real satellite look ON (actual AOI photo on 3D terrain)' : 'Real satellite look OFF (elevation colors)'}
+            >
+              {showSatelliteTexture ? <IconEye size={13} style={{ marginRight: 4 }} /> : <IconEyeOff size={13} style={{ marginRight: 4 }} />} {showSatelliteTexture ? 'Real Look: ON' : 'Real Look: OFF'}
+            </button>
+
+            <button
               className={`terrain3d-btn terrain3d-btn--toggle ${showBuildings ? 'terrain3d-btn--active' : ''}`}
               onClick={() => setShowBuildings((v) => !v)}
               title={showBuildings ? 'Hide building spires (show terrain plane only)' : 'Show 3D buildings'}
@@ -2579,7 +2732,7 @@ export default function Terrain3DViewer({
                 if (selectedTile) {
                   setSelectedTile(null);
                 } else {
-                  setSelectedTile({ r: Math.floor((rows - 1) / 2), c: Math.floor((cols - 1) / 2) });
+                  setSelectedTile({ r: Math.floor((MROWS - 1) / 2), c: Math.floor((MCOLS - 1) / 2) });
                 }
               }}
               title="Select a tile & show floating satellite inspection at height"
@@ -2756,8 +2909,8 @@ export default function Terrain3DViewer({
                         let prevC = selectedTile.c - 1;
                         let prevR = selectedTile.r;
                         if (prevC < 0) {
-                          prevC = cols - 2;
-                          prevR = (prevR - 1 + (rows - 1)) % (rows - 1);
+                          prevC = MCOLS - 2;
+                          prevR = (prevR - 1 + (MROWS - 1)) % (MROWS - 1);
                         }
                         setSelectedTile({ r: prevR, c: prevC });
                       }}
@@ -2770,9 +2923,9 @@ export default function Terrain3DViewer({
                       onClick={() => {
                         let nextC = selectedTile.c + 1;
                         let nextR = selectedTile.r;
-                        if (nextC >= cols - 1) {
+                        if (nextC >= MCOLS - 1) {
                           nextC = 0;
-                          nextR = (nextR + 1) % (rows - 1);
+                          nextR = (nextR + 1) % (MROWS - 1);
                         }
                         setSelectedTile({ r: nextR, c: nextC });
                       }}
